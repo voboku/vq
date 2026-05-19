@@ -101,8 +101,12 @@ const state = {
   lastGranularStep: -1,
   activeVoices: 0,
   maxVoices: 58,
+  mobileMode: false,
+  frameEventCap: 6,
   lastAudioCheck: 0,
   recoveredErrors: 0,
+  audioUnlocked: false,
+  audioState: "none",
   audio: null,
   master: null,
   granularBus: null,
@@ -1852,10 +1856,29 @@ function recordTrigger(event, family, power = 0.5) {
   if (state.triggers.length > 72) state.triggers.splice(0, state.triggers.length - 72);
 }
 
+function isMobileAudioDevice() {
+  return /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) || (navigator.maxTouchPoints > 1 && /Macintosh/i.test(navigator.userAgent));
+}
+
+function applyAudioPerformanceProfile() {
+  state.mobileMode = isMobileAudioDevice();
+  state.maxVoices = state.mobileMode ? 24 : 58;
+  state.frameEventCap = state.mobileMode ? 3 : 6;
+}
+
 async function ensureAudio() {
+  applyAudioPerformanceProfile();
+  if (state.audio?.state === "closed") {
+    state.audio = null;
+    state.audioUnlocked = false;
+  }
   if (state.audio) {
-    if (state.audio.state === "suspended") await state.audio.resume();
-    return;
+    if (state.audio.state === "suspended") {
+      await state.audio.resume();
+    }
+    state.audioState = state.audio.state;
+    updateReadouts();
+    return state.audio.state === "running";
   }
 
   const AudioContext = window.AudioContext || window.webkitAudioContext;
@@ -1884,6 +1907,35 @@ async function ensureAudio() {
   state.reverbGain = spatial.lateReturn;
   state.noiseBuffer = makeNoiseBuffer(audio);
   updateEffects();
+  if (audio.state === "suspended") await audio.resume();
+  state.audioState = audio.state;
+  updateReadouts();
+  return audio.state === "running";
+}
+
+function playSilentUnlockPulse() {
+  if (!state.audio || state.audioUnlocked) return;
+  const audio = state.audio;
+  const buffer = audio.createBuffer(1, Math.max(1, Math.floor(audio.sampleRate * 0.012)), audio.sampleRate);
+  const source = audio.createBufferSource();
+  const gain = audio.createGain();
+  gain.gain.value = 0.00001;
+  source.buffer = buffer;
+  source.connect(gain).connect(audio.destination);
+  source.start(0);
+  source.stop(audio.currentTime + 0.018);
+  state.audioUnlocked = true;
+}
+
+async function unlockAudioFromGesture() {
+  const running = await ensureAudio();
+  if (state.audio?.state === "suspended") {
+    await state.audio.resume();
+  }
+  playSilentUnlockPulse();
+  state.audioState = state.audio?.state || "none";
+  updateReadouts();
+  return running || state.audioState === "running";
 }
 
 function createSpatialResonance(audio, master) {
@@ -1993,6 +2045,8 @@ function checkAudioHealth() {
   if (state.audio.state === "suspended") {
     state.audio.resume().catch(() => {});
   }
+  state.audioState = state.audio.state;
+  updateReadouts();
 }
 
 function canStartVoice() {
@@ -2049,7 +2103,12 @@ async function togglePlay() {
     fileInput.click();
     return;
   }
-  await ensureAudio();
+  const unlocked = await unlockAudioFromGesture();
+  if (!unlocked || state.audio?.state !== "running") {
+    state.audioState = state.audio?.state || "none";
+    updateReadouts();
+    return;
+  }
   state.isPlaying = true;
   const timelinePosition = controls.reverse.checked ? 1 - state.playhead : state.playhead;
   state.startTime = performance.now() - timelinePosition * durationMs();
@@ -2129,6 +2188,11 @@ function rhythmProgress(progress) {
 
 function triggerColumn(timelineProgress, scanProgress) {
   if (!state.events.length || !state.audio) return;
+  if (state.audio.state !== "running") {
+    state.audioState = state.audio.state;
+    updateReadouts();
+    return;
+  }
   if (state.activeVoices > state.maxVoices * 0.88) return;
   const grain = Number(controls.grain.value);
   const bars = Number(controls.loopBars.value);
@@ -2144,7 +2208,7 @@ function triggerColumn(timelineProgress, scanProgress) {
   const metric = state.imageMetrics;
   const capacity = Math.max(0, state.maxVoices - state.activeVoices);
   const requestedVoices = Number(controls.voices.value);
-  const voiceBudget = capacity < 10 ? 1 : capacity < 22 ? 2 : Math.min(requestedVoices, 6);
+  const voiceBudget = capacity < 10 ? 1 : capacity < 22 ? 2 : Math.min(requestedVoices, state.frameEventCap);
   const voiceCount = Math.max(1, Math.min(voiceBudget, Math.round(requestedVoices * (0.24 + metric.density * 0.18 + metric.atmosphere * 0.18))));
   const layer = layerForStep(stepIndex);
   const layerCandidates = eventsInLayerWindow(layer, left, right, voiceCount + 1);
@@ -2160,7 +2224,7 @@ function triggerColumn(timelineProgress, scanProgress) {
   triggerLayerFamilies(stepIndex, left, right, scanX);
 
   let played = false;
-  activeCandidates.forEach((event, index) => {
+  activeCandidates.slice(0, state.frameEventCap).forEach((event, index) => {
     if (!canStartVoice()) return;
     if (Math.random() * 100 > Number(controls.chance.value)) return;
     const stutter = Number(controls.stutter.value) / 100 * (0.25 + metric.complexity * 0.5);
@@ -2318,7 +2382,7 @@ function triggerGranular(stepIndex, left, right, scanX, fallbackEvents) {
   const metric = state.imageMetrics;
   const level = Number(controls.granularLevel.value) / 100;
   if (level <= 0) return;
-  const density = Math.max(1, Number(controls.granularDensity.value));
+  const density = Math.max(1, Math.min(Number(controls.granularDensity.value), state.mobileMode ? 2 : 6));
   const fieldEvents = eventsInLayerWindow("field", left, right, 1);
   const colorEvents = eventsInLayerWindow("colorTrace", left, right, Math.max(1, density));
   const xrayEvents = eventsInLayerWindow("xray", left, right, Math.max(1, Math.ceil(density * 0.5)));
@@ -2332,7 +2396,7 @@ function triggerGranular(stepIndex, left, right, scanX, fallbackEvents) {
   if (seededWave(stepIndex * 19.7 + source.x * 41) > grainChance) return;
 
   state.lastGranularStep = stepIndex;
-  const count = Math.min(density, Math.max(1, state.maxVoices - state.activeVoices));
+  const count = Math.min(density, state.mobileMode ? 2 : 6, Math.max(1, state.maxVoices - state.activeVoices));
   for (let i = 0; i < count; i += 1) {
     const event = sources[(stepIndex + i * 3) % Math.max(1, sources.length)] || source;
     if (!event || !canStartVoice()) break;
@@ -2556,7 +2620,7 @@ function playEvent(event, time) {
   const metric = state.imageMetrics;
   const power = clamp01(event.edge * 0.34 + event.dark * 0.2 + (event.soft || 0) * 0.24 + (event.scanValue || 0) * 0.42 + metric.atmosphere * 0.16);
   let attack = Number(controls.attack.value) / 1000;
-  const release = Number(controls.release.value) / 1000;
+  const release = Math.min(Number(controls.release.value) / 1000, state.mobileMode ? 0.72 : 1.6);
   attack += metric.softness * 0.06 + metric.distance * 0.04;
   attack *= scanTone.attack;
   let duration = Math.max(0.18, release * (0.58 + power * 0.58 + metric.distance * 0.32));
@@ -2851,8 +2915,8 @@ function updateEffects() {
     state.granularBus.gain.setTargetAtTime(controls.granularMute.checked ? 0.0001 : 1, now, 0.035);
   }
   spatial.input.gain.setTargetAtTime(0.42 + resonance * 0.36, now, 0.04);
-  spatial.earlyInput.gain.setTargetAtTime(0.12 + reflectionDensity * 0.42, now, 0.06);
-  spatial.lateInput.gain.setTargetAtTime(0.18 + decayTopology * 0.48, now, 0.06);
+  spatial.earlyInput.gain.setTargetAtTime((0.12 + reflectionDensity * 0.42) * (state.mobileMode ? 0.72 : 1), now, 0.06);
+  spatial.lateInput.gain.setTargetAtTime((0.18 + decayTopology * 0.48) * (state.mobileMode ? 0.62 : 1), now, 0.06);
   spatial.earlyReturn.gain.setTargetAtTime(0.08 + reflectionDensity * 0.22 + fragmentation * 0.08, now, 0.08);
   spatial.lateReturn.gain.setTargetAtTime(0.1 + air * 0.32 + roomSize * 0.18, now, 0.08);
   spatial.memory.gain.setTargetAtTime(Math.min(0.72, 0.08 + memory * 0.34 + decayTopology * 0.2), now, 0.08);
@@ -2863,7 +2927,7 @@ function updateEffects() {
     const offset = 1 + index * 0.37;
     const time = 0.009 + (0.014 + roomSize * 0.09) * offset * (0.72 + fragmentation * 0.42);
     tap.delay.delayTime.setTargetAtTime(Math.min(0.17, time), now, 0.12);
-    tap.gain.gain.setTargetAtTime((0.026 + reflectionDensity * 0.05) * (1 - index * 0.09), now, 0.08);
+    tap.gain.gain.setTargetAtTime((0.026 + reflectionDensity * 0.05) * (1 - index * 0.09) * (state.mobileMode && index > 1 ? 0.25 : 1), now, 0.08);
     tap.pan.pan.setTargetAtTime((index % 2 ? 1 : -1) * (0.16 + width * 0.72), now, 0.12);
   });
 
@@ -2876,7 +2940,7 @@ function updateEffects() {
     line.body.frequency.setTargetAtTime(120 + floor * 540 + clustering * 1200 + index * (90 + resonance * 90), now, 0.1);
     line.body.Q.setTargetAtTime(0.5 + clustering * 4.2 + resonance * 1.8, now, 0.12);
     line.pan.pan.setTargetAtTime((index % 2 ? 1 : -1) * (0.12 + width * 0.82) * (0.55 + seededWave(index + scan.length) * 0.45), now, 0.14);
-    line.out.gain.setTargetAtTime(0.024 + decayTopology * 0.048 + reflectionDensity * 0.012, now, 0.08);
+    line.out.gain.setTargetAtTime((0.024 + decayTopology * 0.048 + reflectionDensity * 0.012) * (state.mobileMode && index > 2 ? 0.28 : 1), now, 0.08);
     if (line.cross) {
       line.cross.forEach((cross, crossIndex) => {
         const sign = (index + crossIndex) % 2 ? 1 : -1;
@@ -2932,10 +2996,11 @@ function updateReadouts() {
   readouts.granular.textContent = controls.granular.checked
     ? `${controls.granularMute.checked ? "muted" : `${controls.granularDensity.value} grains`} / ${controls.granularLevel.value} level`
     : "off";
+  const audioState = state.audio?.state || state.audioState || "none";
   readouts.perform.textContent = [
-    controls.synthMute.checked ? "muted" : "sound",
-    controls.loop.checked ? `${controls.loopBars.value} bars` : "one shot",
-    controls.reverse.checked ? "reverse" : "forward"
+    `audio ${audioState}`,
+    state.mobileMode ? "mobile" : "desktop",
+    controls.synthMute.checked ? "muted" : "sound"
   ].join(" · ");
   readouts.scan.textContent = controls.reverse.checked ? "right → left" : "left → right";
 }
@@ -2971,6 +3036,12 @@ function clearScore() {
 }
 
 loadButton.addEventListener("click", () => fileInput.click());
+playButton.addEventListener("pointerdown", () => {
+  unlockAudioFromGesture().catch(() => {});
+}, { passive: true });
+playButton.addEventListener("touchend", () => {
+  unlockAudioFromGesture().catch(() => {});
+}, { passive: true });
 playButton.addEventListener("click", togglePlay);
 clearButton.addEventListener("click", clearScore);
 sampleLoadButton.addEventListener("click", () => sampleInput.click());
