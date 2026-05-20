@@ -98,6 +98,32 @@ const state = {
   },
   events: [],
   layerEvents: {},
+  cv: {
+    air: 0,
+    transient: 0,
+    sustain: 0,
+    resonance: 0,
+    grain: 0,
+    drone: 0,
+    density: 0,
+    pressure: 0,
+    width: 0.5,
+    silence: 0.5,
+    threshold: 0.42
+  },
+  cvTarget: {
+    air: 0,
+    transient: 0,
+    sustain: 0,
+    resonance: 0,
+    grain: 0,
+    drone: 0,
+    density: 0,
+    pressure: 0,
+    width: 0.5,
+    silence: 0.5,
+    threshold: 0.42
+  },
   isPlaying: false,
   startTime: 0,
   playhead: 0,
@@ -154,6 +180,9 @@ const state = {
   pendingAudioName: "",
   isRecording: false,
   triggers: [],
+  symbolCooldown: new Map(),
+  regionCooldown: new Map(),
+  lastSymbolMemorySweep: 0,
   imageRect: null,
   animation: 0
 };
@@ -229,6 +258,19 @@ const glyphProfiles = {
   "#": { family: "metal", voice: "bell", amp: 0.82, release: 1.0, attack: 0.34, resonance: 1.12, density: 0.84, pitch: -0.08 },
   "%": { family: "broken", voice: "fm", amp: 0.78, release: 0.86, attack: 0.28, resonance: 1.24, density: 0.9, pitch: 0.06 },
   "@": { family: "mass", voice: "choir", amp: 0.92, release: 2.1, attack: 1.36, resonance: 1.45, density: 1, pitch: -0.22 }
+};
+
+const glyphCvProfiles = {
+  " ": { air: 0.7, transient: 0, sustain: 0, resonance: 0, grain: 0, drone: 0, silence: 1 },
+  ".": { air: 0.72, transient: 0.12, sustain: 0.04, resonance: 0.02, grain: 0.18, drone: 0, silence: 0.72 },
+  ":": { air: 0.42, transient: 0.58, sustain: 0.08, resonance: 0.14, grain: 0.2, drone: 0.02, silence: 0.48 },
+  "-": { air: 0.18, transient: 0.06, sustain: 0.72, resonance: 0.18, grain: 0.08, drone: 0.08, silence: 0.18 },
+  "=": { air: 0.12, transient: 0.04, sustain: 0.86, resonance: 0.42, grain: 0.1, drone: 0.18, silence: 0.12 },
+  "+": { air: 0.12, transient: 0.18, sustain: 0.48, resonance: 0.7, grain: 0.34, drone: 0.18, silence: 0.08 },
+  "*": { air: 0.18, transient: 0.32, sustain: 0.26, resonance: 0.5, grain: 0.82, drone: 0.12, silence: 0.06 },
+  "#": { air: 0.08, transient: 0.18, sustain: 0.44, resonance: 0.94, grain: 0.5, drone: 0.42, silence: 0.03 },
+  "%": { air: 0.1, transient: 0.34, sustain: 0.32, resonance: 0.78, grain: 0.96, drone: 0.46, silence: 0.02 },
+  "@": { air: 0.04, transient: 0.08, sustain: 0.72, resonance: 1, grain: 0.56, drone: 1, silence: 0 }
 };
 
 function clamp01(value) {
@@ -956,27 +998,113 @@ function measureImageAtmosphere({ width, height, graySum, brightPixels, darkPixe
 function buildEvents() {
   if (!state.imageData) return;
   const { width, height } = state.imageData;
-  const scan = analysisScan(controls.viewMode.value);
+  const scan = "ascii";
   const threshold = Number(controls.edge.value);
   const step = Math.max(1, 13 - Number(controls.density.value));
   const detailBias = Number(controls.detail.value) * 3.2;
   const layerScans = activeScanLayers();
   state.layerEvents = {};
+  state.symbolCooldown.clear();
+  state.regionCooldown.clear();
   layerScans.forEach((layer) => {
     state.layerEvents[layer] = collectEventsForScan(layer, width, height, step, threshold, detailBias);
   });
   state.activeLayer = scan === "auto" ? dominantAnalysisLayer() : scan;
   state.events = state.layerEvents[state.activeLayer] || collectEventsForScan(state.activeLayer, width, height, step, threshold, detailBias);
+  state.events = state.events.filter((event) => event.scan === "ascii").sort((a, b) => a.x - b.x);
+  computeAsciiCvFields(width, height);
   updateReadouts();
 }
 
+function resetCvFields() {
+  state.cv = {
+    air: 0,
+    transient: 0,
+    sustain: 0,
+    resonance: 0,
+    grain: 0,
+    drone: 0,
+    density: 0,
+    pressure: 0,
+    width: 0.5,
+    silence: 0.5,
+    threshold: 0.42
+  };
+  state.cvTarget = { ...state.cv };
+  state.regionCooldown.clear();
+}
+
+function computeAsciiCvFields(width, height) {
+  if (!state.ascii) return resetCvFields();
+  const sums = {
+    air: 0,
+    transient: 0,
+    sustain: 0,
+    resonance: 0,
+    grain: 0,
+    drone: 0,
+    silence: 0,
+    density: 0,
+    pressure: 0,
+    width: 0,
+    weight: 0
+  };
+  const stepX = Math.max(1, Math.floor(width / 130));
+  const stepY = Math.max(1, Math.floor(height / 82));
+
+  for (let y = 1; y < height - 1; y += stepY) {
+    for (let x = 1; x < width - 1; x += stepX) {
+      const i = y * width + x;
+      const glyphIndex = state.ascii[i] || 0;
+      const glyph = glyphs[glyphIndex] || " ";
+      const profile = glyphCvProfiles[glyph] || glyphCvProfiles[" "];
+      const structure = asciiLocalStructure(x, y, width, height, glyphIndex);
+      const weight = 0.15 + glyphIndex / (glyphs.length - 1) * 0.85;
+      const cluster = structure.cluster;
+      const isolated = structure.isolated;
+      const run = structure.run;
+      const xNorm = x / Math.max(1, width - 1);
+
+      sums.air += profile.air * (0.72 + structure.space * 0.4) * weight;
+      sums.transient += profile.transient * (0.52 + isolated * 0.85) * weight;
+      sums.sustain += profile.sustain * (0.56 + run * 0.7) * weight;
+      sums.resonance += profile.resonance * (0.56 + cluster * 0.64) * weight;
+      sums.grain += profile.grain * (0.58 + isolated * 0.42 + cluster * 0.2) * weight;
+      sums.drone += profile.drone * (0.54 + cluster * 0.58 + run * 0.32) * weight;
+      sums.silence += profile.silence * (1 - Math.min(0.8, cluster * 0.6));
+      sums.density += glyphIndex > 1 ? weight : 0;
+      sums.pressure += glyphIndex / (glyphs.length - 1) * (0.5 + cluster * 0.5);
+      sums.width += Math.abs(xNorm - 0.5) * 2 * weight;
+      sums.weight += weight;
+    }
+  }
+
+  const divisor = Math.max(1, sums.weight);
+  const density = clamp01(sums.density / divisor);
+  const silence = clamp01(sums.silence / divisor);
+  const pressure = clamp01(sums.pressure / divisor);
+  state.cvTarget = {
+    air: clamp01(sums.air / divisor),
+    transient: clamp01(sums.transient / divisor),
+    sustain: clamp01(sums.sustain / divisor),
+    resonance: clamp01(sums.resonance / divisor),
+    grain: clamp01(sums.grain / divisor),
+    drone: clamp01(sums.drone / divisor),
+    density,
+    pressure,
+    width: clamp01(0.24 + sums.width / divisor * 0.72),
+    silence,
+    threshold: clamp01(0.38 + silence * 0.2 + density * 0.16 - pressure * 0.12)
+  };
+  state.cv = { ...state.cvTarget };
+}
+
 function analysisScan(mode) {
-  if (mode === "normal" || mode === "ascii") return "ascii";
-  return mode;
+  return "ascii";
 }
 
 function activeScanLayers() {
-  return ["ascii", "field", "xray"];
+  return ["ascii"];
 }
 
 function dominantAnalysisLayer() {
@@ -992,7 +1120,7 @@ function dominantAnalysisLayer() {
 }
 
 function collectEventsForScan(scan, width, height, step, threshold, detailBias) {
-  const map = state.maps[scan] || state.maps.field;
+  const map = state.maps.ascii;
   const signature = state.imageSignature || {};
   const q = signature.gray || { q10: 0.1, q50: 0.5, q90: 0.9 };
   const tonalSpread = Math.max(0.08, q.q90 - q.q10);
@@ -1018,12 +1146,23 @@ function collectEventsForScan(scan, width, height, step, threshold, detailBias) 
       if (accepted) {
         const glyphIndex = state.ascii?.[i] || 0;
         const glyph = glyphs[glyphIndex] || " ";
+        if (glyphIndex === 0) continue;
         const symbolic = asciiLocalStructure(x, y, width, height, glyphIndex);
+        const profile = glyphProfiles[glyph] || glyphProfiles["-"];
         const tonalRarity = clamp01(Math.abs(bright - q.q50) / tonalSpread);
         const colorRarity = color ? clamp01((color.saturation - (signature.color?.saturationMean || 0)) / 0.42) : 0;
         const localContrast = clamp01(Math.abs(bright - ((right + down) / 510)) / Math.max(0.035, signature.texture?.peak || 0.12));
         const orientation = (angle + Math.PI) / (Math.PI * 2);
         const sourceStrength = clamp01(scanValue * 0.5 + tonalRarity * 0.14 + localContrast * 0.14 + colorRarity * 0.1 + symbolic.cluster * 0.16 + symbolic.isolated * 0.12);
+        const symbolEnergy = clamp01(
+          glyphIndex / (glyphs.length - 1) * 0.42
+          + profile.density * 0.2
+          + symbolic.cluster * 0.18
+          + symbolic.isolated * 0.16
+          + symbolic.run * 0.14
+          - symbolic.space * 0.24
+        );
+        if (symbolEnergy < 0.16) continue;
         const pitchBias = scanPitchBias(scan, {
           tonalRarity,
           colorRarity,
@@ -1037,6 +1176,8 @@ function collectEventsForScan(scan, width, height, step, threshold, detailBias) 
         events.push({
           x: x / width,
           y: y / height,
+          cellX: Math.round((x / width) * 160),
+          cellY: Math.round((y / height) * 100),
           edge: edgeNorm,
           dark,
           color,
@@ -1057,6 +1198,8 @@ function collectEventsForScan(scan, width, height, step, threshold, detailBias) 
           symbolCluster: symbolic.cluster,
           symbolIsolated: symbolic.isolated,
           symbolSpace: symbolic.space,
+          symbolEnergy,
+          symbolKey: `${glyph}:${Math.round((x / width) * 160)}:${Math.round((y / height) * 100)}`,
           atmosphere: state.imageMetrics.atmosphere,
           distance: state.imageMetrics.distance
         });
@@ -1065,13 +1208,13 @@ function collectEventsForScan(scan, width, height, step, threshold, detailBias) 
   }
 
   const maxEventsByScan = {
-    ascii: 1800,
+    ascii: 1200,
     field: 1600,
     colorTrace: 1200,
     xray: 520
   };
-  const densityBoost = Number(controls.density.value) * (scan === "xray" ? 28 : scan === "ascii" ? 120 : 90);
-  const detailBoost = Number(controls.detail.value) * (scan === "xray" ? 32 : scan === "ascii" ? 170 : 140);
+  const densityBoost = Number(controls.density.value) * 82;
+  const detailBoost = Number(controls.detail.value) * 112;
   const maxEvents = Math.round((maxEventsByScan[scan] || 900) + detailBoost + densityBoost);
   return pruneEvents(events, maxEvents);
 }
@@ -1148,11 +1291,8 @@ function scanThreshold(scan, threshold, detailBias) {
 }
 
 function scanFallback(scan, event) {
-  if (scan === "ascii") return event.dark > 0.16 || event.edgeNorm > 0.1 || event.color?.saturation > 0.24;
-  if (scan === "field") return false;
-  if (scan === "colorTrace") return event.color && event.color.saturation > 0.18;
-  if (scan === "xray") return event.edgeNorm > 0.34 && Math.abs(event.bright - 0.5) < 0.045;
-  return false;
+  if (scan !== "ascii") return false;
+  return event.dark > 0.26 || event.edgeNorm > 0.16 || event.color?.saturation > 0.38;
 }
 
 function pruneEvents(events, maxEvents) {
@@ -1166,9 +1306,10 @@ function pruneEvents(events, maxEvents) {
     const bucketX = Math.floor(event.x * 180);
     const bucketY = Math.floor(event.y * 90);
     const key = `${bucketX}:${bucketY}`;
-    const score = event.scan === "ascii"
-      ? (event.symbolDensity || 0) * 0.34 + (event.symbolCluster || 0) * 0.26 + (event.symbolIsolated || 0) * 0.22 + (event.symbolRun || 0) * 0.18
-      : event.edge * 0.62 + event.dark * 0.24 + (event.soft || 0) * 0.14;
+    const score = (event.symbolEnergy || 0) * 0.58
+      + (event.symbolDensity || 0) * 0.18
+      + (event.symbolCluster || 0) * 0.12
+      + (event.symbolIsolated || 0) * 0.12;
     const current = buckets.get(key);
     if (!current || score > current.score) buckets.set(key, { event, score });
   }
@@ -1814,31 +1955,30 @@ function drawAsciiLayer(area, contrast) {
       const value = state.maps.ascii?.[i] || glyphIndex / (glyphs.length - 1);
       const px = (x / width) * area.w;
       const py = (y / height) * area.h;
-      const reaction = asciiReactionAt(x / width, y / height);
-      const bloom = reaction * 0.22;
+      const reaction = asciiReactionAt(x / width, y / height, glyph);
+      const bloom = reaction * 0.46;
       if (reaction > 0.1) {
-        ctx.fillStyle = `rgba(232, 226, 180, ${0.05 + reaction * 0.16})`;
+        ctx.fillStyle = `rgba(232, 226, 180, ${0.025 + reaction * 0.09})`;
         ctx.fillRect(px - fontSize * 0.58, py - fontSize * 0.72, fontSize * 1.16, fontSize * 1.2);
       }
-      const replace = reaction > 0.55 && seededWave(x * 9.1 + y * 4.7 + state.playhead * 19) > 0.68;
-      const displayGlyph = replace ? glyphs[Math.min(glyphs.length - 1, glyphIndex + 1)] : glyph;
-      ctx.fillStyle = `rgba(42, 47, 44, ${0.055 + value * 0.42 * contrast + bloom})`;
-      ctx.fillText(displayGlyph, px, py);
+      ctx.fillStyle = `rgba(42, 47, 44, ${0.045 + value * 0.34 * contrast + bloom})`;
+      ctx.fillText(glyph, px, py);
     }
   }
   ctx.restore();
 }
 
-function asciiReactionAt(x, y) {
+function asciiReactionAt(x, y, glyph) {
   let amount = 0;
   const now = performance.now();
   state.triggers.forEach((trigger) => {
+    if (trigger.scan !== "ascii" || trigger.glyph !== glyph) return;
     const age = (now - trigger.created) / trigger.life;
     if (age < 0 || age > 1) return;
     const dx = trigger.x - x;
     const dy = trigger.y - y;
     const distance = Math.hypot(dx, dy);
-    const reach = 0.018 + (trigger.radius || 3) / 720;
+    const reach = 0.008 + (trigger.radius || 2) / 1800;
     if (distance < reach) amount += (1 - distance / reach) * (1 - age);
   });
   return clamp01(amount);
@@ -2005,34 +2145,7 @@ function drawPlayhead(area) {
 }
 
 function drawEventField(area) {
-  if (!state.events.length) return;
-  ctx.save();
-  ctx.beginPath();
-  ctx.rect(area.x, area.y, area.w, area.h);
-  ctx.clip();
-  const scanX = state.playhead;
-  const scanBand = state.isPlaying ? 0.018 : 0;
-  const readEvents = eventsInWindow(Math.max(0, scanX - 0.026), Math.min(1, scanX + 0.026), 90);
-  const ambientEvents = state.isPlaying ? readEvents : state.events;
-  const skip = Math.max(1, Math.floor(ambientEvents.length / (state.isPlaying ? 90 : 900)));
-  ambientEvents.forEach((event, index) => {
-    if (index % skip) return;
-    const x = area.x + event.x * area.w;
-    const y = area.y + event.y * area.h;
-    const distance = Math.abs(event.x - scanX);
-    const nearScan = state.isPlaying ? Math.max(0, 1 - distance * 62) : 0;
-    const inReadZone = state.isPlaying && distance <= scanBand;
-    const frequencyAlpha = (inReadZone ? 0.24 : 0.06) + event.edge * 0.05 + nearScan * 0.2;
-    drawFeatureGlyph(x, y, event, frequencyAlpha, inReadZone ? 1.4 : 0.72, index);
-    if (nearScan > 0.04) {
-      ctx.strokeStyle = `rgba(142, 146, 137, ${nearScan * 0.24})`;
-      ctx.beginPath();
-      ctx.moveTo(area.x + scanX * area.w, y);
-      ctx.lineTo(x + 22 + event.edge * 14, y);
-      ctx.stroke();
-    }
-  });
-  ctx.restore();
+  return;
 }
 
 function drawTriggers(area) {
@@ -2045,17 +2158,22 @@ function drawTriggers(area) {
     const x = area.x + trigger.x * area.w;
     const y = area.y + trigger.y * area.h;
     const source = trigger.scan || trigger.family || "contour";
-    const radius = trigger.radius * (1 + age * (source === "shadow" || source === "low" ? 3.2 : 2.0));
+    const radius = source === "ascii" ? trigger.radius * (1 + age * 0.35) : trigger.radius * (1 + age * 2.0);
     ctx.save();
     ctx.beginPath();
     ctx.rect(area.x, area.y, area.w, area.h);
     ctx.clip();
-    ctx.strokeStyle = `rgba(124, 129, 121, ${alpha * 0.1})`;
-    ctx.beginPath();
-    ctx.moveTo(area.x + state.playhead * area.w, y);
-    ctx.lineTo(x, y);
-    ctx.stroke();
-    drawFeatureGlyph(x, y, trigger, alpha * 0.42, 1 + age, age * 37);
+    if (source === "ascii") {
+      ctx.fillStyle = `rgba(42, 47, 44, ${alpha * 0.18})`;
+      ctx.fillRect(x - radius * 0.5, y - radius * 0.5, radius, radius);
+    } else {
+      ctx.strokeStyle = `rgba(124, 129, 121, ${alpha * 0.1})`;
+      ctx.beginPath();
+      ctx.moveTo(area.x + state.playhead * area.w, y);
+      ctx.lineTo(x, y);
+      ctx.stroke();
+      drawFeatureGlyph(x, y, trigger, alpha * 0.42, 1 + age, age * 37);
+    }
     ctx.restore();
   });
 }
@@ -2073,7 +2191,11 @@ function recordTrigger(event, family, power = 0.5) {
     scanValue: event.scanValue,
     angle: event.angle,
     color: event.color,
-    life: 360 + power * 360,
+    glyph: event.glyph,
+    glyphIndex: event.glyphIndex,
+    cellX: event.cellX,
+    cellY: event.cellY,
+    life: event.scan === "ascii" ? 120 + power * 130 : 360 + power * 360,
     created: performance.now()
   });
   if (state.triggers.length > 72) state.triggers.splice(0, state.triggers.length - 72);
@@ -2306,23 +2428,8 @@ function verifyGraphContext() {
 function playRouteProbe(destination, label, gainValue = 0.006) {
   const audio = state.audio;
   if (!audio || audio.state !== "running" || !destination || destination.context !== audio) return false;
-  const now = audio.currentTime || 0;
-  const oscillator = audio.createOscillator();
-  const gain = audio.createGain();
-  oscillator.type = "sine";
-  oscillator.frequency.setValueAtTime(label === "granular" ? 880 : 520, now);
-  gain.gain.setValueAtTime(0.0001, now);
-  gain.gain.exponentialRampToValueAtTime(gainValue, now + 0.01);
-  gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.09);
-  oscillator.connect(gain).connect(destination);
-  oscillator.start(now);
-  oscillator.stop(now + 0.11);
-  cleanupNodes([oscillator, gain], 0.18);
   state.lastSourceStarted = label;
-  window.setTimeout(() => {
-    state.lastSourceStopped = label;
-    updateReadouts();
-  }, 160);
+  state.lastSourceStopped = label;
   return true;
 }
 
@@ -2650,18 +2757,18 @@ function playDirectUnlockBeep(audio) {
   const gain = audio.createGain();
   oscillator.type = "square";
   oscillator.frequency.value = 880;
-  gain.gain.value = 0.08;
+  gain.gain.value = 0.000001;
   oscillator.connect(gain);
   gain.connect(audio.destination);
   oscillator.start(now);
-  oscillator.stop(now + 0.18);
-  cleanupNodes([oscillator, gain], 0.28);
-  state.lastSourceStarted = "direct";
-  logAudioDebug("first sound triggered", { direct: true });
+  oscillator.stop(now + 0.05);
+  cleanupNodes([oscillator, gain], 0.12);
+  state.lastSourceStarted = "silent unlock";
+  logAudioDebug("silent unlock source", { direct: true });
   window.setTimeout(() => {
-    state.lastSourceStopped = "direct";
+    state.lastSourceStopped = "silent unlock";
     updateReadouts();
-  }, 240);
+  }, 100);
 }
 
 function hardUnlockAudioFromGesture(event, options = {}) {
@@ -2790,19 +2897,6 @@ function playUnlockPulse(force = false) {
 
 function playMobileStartProbe() {
   if (!state.mobileMode || !state.audio || state.audio.state !== "running" || state.mobileStartProbe) return;
-  const audio = state.audio;
-  const now = audio.currentTime || 0;
-  const oscillator = audio.createOscillator();
-  const gain = audio.createGain();
-  oscillator.type = "sine";
-  oscillator.frequency.setValueAtTime(660, now);
-  gain.gain.setValueAtTime(0.0001, now);
-  gain.gain.exponentialRampToValueAtTime(0.028, now + 0.012);
-  gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.11);
-  oscillator.connect(gain).connect(state.master || audio.destination);
-  oscillator.start(now);
-  oscillator.stop(now + 0.13);
-  cleanupNodes([oscillator, gain], 0.2);
   state.mobileStartProbe = true;
 }
 
@@ -3149,6 +3243,8 @@ function triggerColumn(timelineProgress, scanProgress) {
   state.lastColumn = stepIndex;
 
   const scanX = Math.max(0, Math.min(0.999, scanProgress));
+  updateAsciiCvForScan(scanX);
+  updateEffects();
   const windowSize = Math.max(0.008, 1 / (grain * 3.2));
   const left = Math.max(0, scanX - windowSize);
   const right = Math.min(1, scanX + windowSize);
@@ -3156,15 +3252,10 @@ function triggerColumn(timelineProgress, scanProgress) {
   const capacity = Math.max(0, state.maxVoices - state.activeVoices);
   const requestedVoices = Number(controls.voices.value);
   const voiceBudget = capacity < 10 ? 1 : capacity < 22 ? 2 : Math.min(requestedVoices, state.frameEventCap);
-  const voiceCount = Math.max(1, Math.min(voiceBudget, Math.round(requestedVoices * (0.24 + metric.density * 0.18 + metric.atmosphere * 0.18))));
-  const layer = layerForStep(stepIndex);
-  const layerCandidates = eventsInLayerWindow(layer, left, right, voiceCount + 1);
-  const candidates = eventsInWindow(left, right, voiceCount);
-  const activeCandidates = layerCandidates.length
-    ? layerCandidates
-    : candidates;
+  const voiceCount = Math.max(1, Math.min(voiceBudget, Math.round(requestedVoices * (0.12 + state.cv.transient * 0.22 + state.cv.resonance * 0.16 + state.cv.pressure * 0.12))));
+  const candidates = eventsInWindow(left, right, Math.max(voiceCount * 6, 10));
+  const activeCandidates = selectAsciiEvents(candidates, stepIndex, voiceCount);
   triggerGranular(stepIndex, left, right, scanX, activeCandidates);
-  triggerLayerFamilies(stepIndex, left, right, scanX);
 
   let played = false;
   activeCandidates.slice(0, state.frameEventCap).forEach((event, index) => {
@@ -3175,42 +3266,217 @@ function triggerColumn(timelineProgress, scanProgress) {
     const offGrid = Math.sin((state.lastColumn + index) * 1.17 + event.y * 5) * stutter * 0.014;
     const offset = Math.max(0, stagger + offGrid);
     played = playEvent(event, state.audio.currentTime + offset) || played;
-    if (stutter > 0.55 && event.edge + event.dark > 0.92 && index % 3 === 0) {
-      if (canStartVoice()) {
-        playEvent({ ...event, y: Math.max(0, event.y - 0.035), edge: event.edge * 0.8 }, state.audio.currentTime + offset + 0.055);
-      }
-    }
   });
+}
 
-  if (!played && activeCandidates[0] && canStartVoice()) {
-    playEvent(activeCandidates[0], state.audio.currentTime);
+function updateAsciiCvForScan(scanX) {
+  if (!state.ascii || !state.imageData) return;
+  const windowWidth = 0.036 + Number(controls.grain.value) / 18 * 0.026;
+  const left = Math.max(0, scanX - windowWidth);
+  const right = Math.min(1, scanX + windowWidth);
+  const local = eventsInWindow(left, right, 36);
+  const columnCv = sampleAsciiCvColumn(scanX, windowWidth);
+  const next = columnCv ? { ...columnCv } : { ...state.cvTarget };
+
+  if (local.length) {
+    const sums = {
+      air: 0,
+      transient: 0,
+      sustain: 0,
+      resonance: 0,
+      grain: 0,
+      drone: 0,
+      density: 0,
+      pressure: 0,
+      width: 0,
+      silence: 0,
+      weight: 0
+    };
+    local.forEach((event) => {
+      const profile = glyphCvProfiles[event.glyph] || glyphCvProfiles[" "];
+      const distance = Math.abs(event.x - scanX) / Math.max(0.001, windowWidth);
+      const proximity = clamp01(1 - distance);
+      const energy = event.symbolEnergy || event.symbolDensity || 0;
+      const weight = (0.22 + energy * 0.78) * (0.35 + proximity * 0.65);
+      sums.air += profile.air * weight;
+      sums.transient += profile.transient * (0.62 + (event.symbolIsolated || 0) * 0.6) * weight;
+      sums.sustain += profile.sustain * (0.62 + (event.symbolRun || 0) * 0.62) * weight;
+      sums.resonance += profile.resonance * (0.66 + (event.symbolCluster || 0) * 0.58) * weight;
+      sums.grain += profile.grain * (0.64 + (event.symbolIsolated || 0) * 0.46) * weight;
+      sums.drone += profile.drone * (0.7 + (event.symbolCluster || 0) * 0.52) * weight;
+      sums.density += (event.symbolDensity || 0) * weight;
+      sums.pressure += energy * weight;
+      sums.width += Math.abs(event.x - 0.5) * 2 * weight;
+      sums.silence += profile.silence * weight;
+      sums.weight += weight;
+    });
+    const weight = Math.max(1e-5, sums.weight);
+    const eventCv = {
+      air: clamp01(sums.air / weight),
+      transient: clamp01(sums.transient / weight),
+      sustain: clamp01(sums.sustain / weight),
+      resonance: clamp01(sums.resonance / weight),
+      grain: clamp01(sums.grain / weight),
+      drone: clamp01(sums.drone / weight),
+      density: clamp01(sums.density / weight),
+      pressure: clamp01(sums.pressure / weight),
+      width: clamp01(0.18 + sums.width / weight * 0.82),
+      silence: clamp01(sums.silence / weight)
+    };
+    const eventWeight = clamp01(0.42 + eventCv.pressure * 0.34 + eventCv.transient * 0.18);
+    Object.keys(eventCv).forEach((key) => {
+      next[key] = clamp01((next[key] ?? 0) * (1 - eventWeight) + eventCv[key] * eventWeight);
+    });
+    next.threshold = clamp01(0.34 + next.silence * 0.24 + next.density * 0.16 - next.pressure * 0.18);
   }
+
+  const smoothing = 0.052 + state.imageMetrics.softness * 0.032 + state.cv.sustain * 0.034 + state.cv.air * 0.018;
+  Object.keys(state.cv).forEach((key) => {
+    state.cv[key] += ((next[key] ?? state.cv[key]) - state.cv[key]) * smoothing;
+    state.cv[key] = clamp01(state.cv[key]);
+  });
+}
+
+function sampleAsciiCvColumn(scanX, windowWidth) {
+  if (!state.ascii || !state.imageData) return null;
+  const { width, height } = state.imageData;
+  const centerX = Math.max(1, Math.min(width - 2, Math.floor(scanX * width)));
+  const radius = Math.max(2, Math.floor(windowWidth * width * 0.5));
+  const stepY = Math.max(1, Math.floor(height / 72));
+  const stepX = Math.max(1, Math.floor(radius / 3));
+  const sums = {
+    air: 0,
+    transient: 0,
+    sustain: 0,
+    resonance: 0,
+    grain: 0,
+    drone: 0,
+    density: 0,
+    pressure: 0,
+    width: 0,
+    silence: 0,
+    weight: 0
+  };
+
+  for (let x = Math.max(1, centerX - radius); x <= Math.min(width - 2, centerX + radius); x += stepX) {
+    const distance = Math.abs(x - centerX) / Math.max(1, radius);
+    const proximity = 1 - distance;
+    for (let y = 1; y < height - 1; y += stepY) {
+      const glyphIndex = state.ascii[y * width + x] || 0;
+      const glyph = glyphs[glyphIndex] || " ";
+      const profile = glyphCvProfiles[glyph] || glyphCvProfiles[" "];
+      const structure = asciiLocalStructure(x, y, width, height, glyphIndex);
+      const energy = glyphIndex / (glyphs.length - 1);
+      const weight = (0.18 + proximity * 0.82) * (0.28 + energy * 0.72 + structure.space * 0.22);
+      sums.air += profile.air * (0.72 + structure.space * 0.28) * weight;
+      sums.transient += profile.transient * (0.62 + structure.isolated * 0.46) * weight;
+      sums.sustain += profile.sustain * (0.58 + structure.run * 0.58) * weight;
+      sums.resonance += profile.resonance * (0.58 + structure.cluster * 0.5) * weight;
+      sums.grain += profile.grain * (0.62 + structure.isolated * 0.28) * weight;
+      sums.drone += profile.drone * (0.62 + structure.cluster * 0.42) * weight;
+      sums.density += energy * weight;
+      sums.pressure += energy * (0.62 + structure.cluster * 0.38) * weight;
+      sums.width += Math.abs(x / Math.max(1, width - 1) - 0.5) * 2 * weight;
+      sums.silence += profile.silence * (0.68 + structure.space * 0.32) * weight;
+      sums.weight += weight;
+    }
+  }
+
+  const weight = Math.max(1e-5, sums.weight);
+  const density = clamp01(sums.density / weight);
+  const pressure = clamp01(sums.pressure / weight);
+  const silence = clamp01(sums.silence / weight);
+  return {
+    air: clamp01(sums.air / weight),
+    transient: clamp01(sums.transient / weight),
+    sustain: clamp01(sums.sustain / weight),
+    resonance: clamp01(sums.resonance / weight),
+    grain: clamp01(sums.grain / weight),
+    drone: clamp01(sums.drone / weight),
+    density,
+    pressure,
+    width: clamp01(0.24 + sums.width / weight * 0.72),
+    silence,
+    threshold: clamp01(0.38 + silence * 0.26 + density * 0.2 - pressure * 0.16)
+  };
+}
+
+function sweepSymbolMemory(now) {
+  if (now - state.lastSymbolMemorySweep < 1200) return;
+  state.lastSymbolMemorySweep = now;
+  state.symbolCooldown.forEach((until, key) => {
+    if (until < now) state.symbolCooldown.delete(key);
+  });
+  state.regionCooldown.forEach((until, key) => {
+    if (until < now) state.regionCooldown.delete(key);
+  });
+}
+
+function selectAsciiEvents(candidates, stepIndex, count) {
+  if (!candidates.length) return [];
+  const now = performance.now();
+  sweepSymbolMemory(now);
+  const densityCooling = clamp01((state.activeVoices / Math.max(1, state.maxVoices)) * 1.2);
+  const erosion = Number(controls.chance.value) / 70;
+  const quietness = clamp01(0.18 + state.imageMetrics.emptiness * 0.14 + densityCooling * 0.34 + state.cv.silence * 0.18);
+  const breath = 0.5 + Math.sin(performance.now() * 0.00042 + state.cv.pressure * 2.7) * 0.5;
+  const selected = [];
+
+  candidates
+    .map((event, index) => {
+      const profile = glyphProfiles[event.glyph] || glyphProfiles["-"];
+      const key = event.symbolKey || `${event.glyph}:${Math.round(event.x * 160)}:${Math.round(event.y * 100)}`;
+      const regionKey = regionKeyForEvent(event);
+      const memory = state.symbolCooldown.get(key) || 0;
+      const regionMemory = state.regionCooldown.get(regionKey) || 0;
+      const isCooling = memory > now;
+      const isRegionCooling = regionMemory > now;
+      const breathPenalty = (1 - breath) * (state.cv.pressure * 0.22 + state.cv.resonance * 0.12);
+      const competition = featureScore(event)
+        + (event.symbolEnergy || 0) * 0.72
+        + profile.density * 0.16
+        + state.cv.transient * (event.symbolIsolated || 0) * 0.24
+        + state.cv.resonance * (event.symbolCluster || 0) * 0.18
+        + state.cv.sustain * (event.symbolRun || 0) * 0.16
+        + seededWave(stepIndex * 4.71 + index * 2.13 + event.x * 19.1) * 0.08
+        - (isCooling ? 0.9 : 0)
+        - (isRegionCooling ? 0.42 + state.cv.pressure * 0.26 : 0)
+        - breathPenalty
+        - quietness * 0.28;
+      return { event, key, regionKey, competition };
+    })
+    .filter((item) => {
+      const threshold = state.cv.threshold + quietness * 0.16 + (1 - breath) * state.cv.density * 0.14 - erosion * 0.16 - state.cv.transient * 0.08;
+      return item.competition > threshold;
+    })
+    .sort((a, b) => b.competition - a.competition)
+    .some((item) => {
+      if (selected.length >= count) return true;
+      if (state.symbolCooldown.get(item.key) > now) return false;
+      const profile = glyphProfiles[item.event.glyph] || glyphProfiles["-"];
+      const cooldown = 190 + profile.release * 260 + (item.event.symbolCluster || 0) * 280 + densityCooling * 420 + state.cv.pressure * 220;
+      const regionCooldown = 340 + (item.event.symbolCluster || 0) * 520 + state.cv.density * 420 + state.cv.sustain * 260;
+      state.symbolCooldown.set(item.key, now + cooldown);
+      state.regionCooldown.set(item.regionKey, now + regionCooldown);
+      selected.push(item.event);
+      return false;
+    });
+
+  return selected;
+}
+
+function regionKeyForEvent(event) {
+  return `${Math.floor(event.x * 28)}:${Math.floor(event.y * 18)}`;
 }
 
 function layerForStep(stepIndex) {
-  const mode = controls.viewMode.value;
-  const scan = analysisScan(mode);
-  if (scan !== "auto") return scan;
-  const weights = layerWeights();
-  const total = weights.reduce((sum, item) => sum + item.weight, 0) || 1;
-  let cursor = seededWave(stepIndex * 0.917 + state.imageMetrics.complexity * 11.3) * total;
-  for (const item of weights) {
-    cursor -= item.weight;
-    if (cursor <= 0) return item.layer;
-  }
-  return state.activeLayer || "ascii";
+  return "ascii";
 }
 
 function layerWeights() {
-  const metric = state.imageMetrics;
-  const stats = state.layerStats || {};
   return [
-    { layer: "ascii", weight: 0.22 + (stats.ascii?.average || 0) * 5.4 + (stats.ascii?.coverage || 0) * 2.2 + metric.complexity * 1.2 },
-    { layer: "field", weight: 0.08 + (stats.field?.average || 0) * 6.2 + (stats.field?.coverage || 0) * 2.4 + metric.complexity * 1.1 },
-    { layer: "xray", weight: 0.02 + (stats.xray?.peak || 0) * 1.4 + (stats.xray?.coverage || 0) * 0.62 + metric.softness * 0.22 }
-  ]
-    .filter((item) => (state.layerEvents[item.layer] || []).length)
-    .sort((a, b) => b.weight - a.weight);
+    { layer: "ascii", weight: 1 }
+  ];
 }
 
 function eventsInWindow(left, right, count) {
@@ -3315,6 +3581,10 @@ function featureScore(event) {
   return (event.sourceStrength || 0) * 0.82
     + (event.scanValue || 0) * 0.52
     + symbolScore
+    + (event.symbolEnergy || 0) * 0.3
+    + state.cv.pressure * 0.12
+    + state.cv.resonance * (event.symbolCluster || 0) * 0.12
+    + state.cv.transient * (event.symbolIsolated || 0) * 0.12
     + (event.tonalRarity || 0) * 0.24
     + (event.localContrast || 0) * 0.22
     + event.edge * 0.18
@@ -3326,19 +3596,17 @@ function triggerGranular(stepIndex, left, right, scanX, fallbackEvents) {
   if (!controls.granular.checked || controls.granularMute.checked || controls.synthMute.checked || !state.audio) return;
   if (stepIndex === state.lastGranularStep || state.activeVoices > state.maxVoices * 0.9) return;
   const metric = state.imageMetrics;
-  const level = Number(controls.granularLevel.value) / 100;
+  const level = Number(controls.granularLevel.value) / 100 * (0.52 + state.cv.grain * 0.74 + state.cv.transient * 0.18);
   if (level <= 0) return;
-  const density = Math.max(1, Math.min(Number(controls.granularDensity.value), state.mobileMode ? 4 : 12));
+  const density = Math.max(1, Math.min(Math.round(Number(controls.granularDensity.value) * (0.46 + state.cv.grain * 0.72 + state.cv.pressure * 0.24)), state.mobileMode ? 4 : 12));
   const asciiEvents = eventsInLayerWindow("ascii", left, right, Math.max(1, density + 1));
-  const fieldEvents = eventsInLayerWindow("field", left, right, Math.max(2, Math.ceil(density * 0.55)));
-  const xrayEvents = eventsInLayerWindow("xray", left, right, Math.max(1, Math.ceil(density * 0.5)));
-  const sources = [...asciiEvents, ...fieldEvents, ...xrayEvents, ...fallbackEvents];
+  const sources = [...asciiEvents, ...fallbackEvents].filter((event) => event?.scan === "ascii");
   const source = sources[stepIndex % Math.max(1, sources.length)];
   if (!source) return;
 
-  const imageChance = clamp01(metric.complexity * 0.28 + metric.density * 0.22 + (source.scanValue || 0) * 0.28 + source.edge * 0.2);
+  const imageChance = clamp01(metric.complexity * 0.18 + metric.density * 0.14 + state.cv.grain * 0.34 + state.cv.transient * 0.18 + (source.scanValue || 0) * 0.16);
   const erosion = Number(controls.chance.value) / 70;
-  const grainChance = clamp01(0.32 + imageChance * 0.66 + level * 0.3 + erosion * 0.12);
+  const grainChance = clamp01(0.18 + imageChance * 0.62 + level * 0.24 + erosion * 0.1 - state.cv.silence * 0.18);
   if (seededWave(stepIndex * 19.7 + source.x * 41) > grainChance) return;
 
   state.lastGranularStep = stepIndex;
@@ -3352,36 +3620,12 @@ function triggerGranular(stepIndex, left, right, scanX, fallbackEvents) {
 }
 
 function triggerLayerFamilies(stepIndex, left, right, scanX) {
-  if (!state.audio || state.activeVoices > state.maxVoices * 0.78) return;
-  const time = state.audio.currentTime;
-  const weights = layerWeights().slice(0, 4);
-  let anyLocal = false;
-
-  weights.forEach((weighted, index) => {
-    if (!canStartVoice()) return;
-    const cadence = 2 + index + Math.round((1 - Math.min(1, weighted.weight / 5)) * 2);
-    if (stepIndex % cadence !== 0) return;
-    if (weighted.layer === "colorTrace" && !controls.colorMap.checked) return;
-    const event = eventsInLayerWindow(weighted.layer, left, right, index === 0 ? 2 : 1)[0];
-    if (!event) return;
-    anyLocal = true;
-    playEvent({ ...event, soundFamily: soundFamilyForLayer(weighted.layer) }, time + 0.006 + index * 0.014);
-  });
-
-  if (!anyLocal && state.imageMetrics.emptiness < 0.38 && stepIndex % 9 === 0) {
-    const near = nearestEvents(scanX, 1)[0];
-    if (near && canStartVoice()) {
-      playEvent({ ...near, soundFamily: soundFamilyForLayer(near.scan) }, time);
-    }
-  }
+  return;
 }
 
 function soundFamilyForLayer(layer) {
   const table = {
-    ascii: "symbol",
-    field: "air",
-    colorTrace: "color",
-    xray: "air"
+    ascii: "symbol"
   };
   return table[layer] || "fallback";
 }
@@ -3500,6 +3744,7 @@ function timbreForEvent(event) {
 function scanBehavior(event) {
   const value = clamp01(event.scanValue || 0);
   const symbolic = symbolicBehaviorForEvent(event);
+  const cv = state.cv;
   const table = {
     ascii: { amp: symbolic.amp, attack: symbolic.attack, release: symbolic.release, cutoff: 0.86 + symbolic.density * 0.62, resonance: symbolic.resonance, pan: 0.58 + (event.symbolIsolated || 0) * 0.55, voice: symbolic.voice },
     contour: { amp: 1.0, attack: 0.9, release: 0.92, cutoff: 1.08, resonance: 0.5, pan: 1.0, voice: null },
@@ -3514,9 +3759,11 @@ function scanBehavior(event) {
   const behavior = table[event.scan] || table.contour;
   return {
     ...behavior,
-    amp: behavior.amp * (0.72 + value * 0.56),
-    cutoff: behavior.cutoff * (0.82 + value * 0.42),
-    resonance: behavior.resonance * (0.55 + value * 0.9)
+    amp: behavior.amp * (0.46 + value * 0.34 + cv.pressure * 0.24 + cv.transient * 0.16 - cv.silence * 0.18),
+    cutoff: behavior.cutoff * (0.64 + cv.air * 0.36 + cv.transient * 0.28 + value * 0.18),
+    resonance: behavior.resonance * (0.42 + cv.resonance * 0.82 + value * 0.28),
+    cvRelease: 0.72 + cv.sustain * 0.85 + cv.drone * 0.42 - cv.transient * 0.18,
+    cvWidth: 0.42 + cv.width * 0.78
   };
 }
 
@@ -3585,13 +3832,14 @@ function playEvent(event, time) {
     if (scaleBehavior.family === "raga" || scaleBehavior.family === "spectral") voice = "choir";
   }
   const metric = state.imageMetrics;
+  const cv = state.cv;
   const power = clamp01(event.edge * 0.24 + event.dark * 0.14 + (event.soft || 0) * 0.18 + (event.scanValue || 0) * 0.34 + metric.atmosphere * 0.12 + (event.symbolDensity || 0) * 0.24 + (event.symbolCluster || 0) * 0.18);
   let attack = Number(controls.attack.value) / 1000;
   const release = Math.min(Number(controls.release.value) / 1000, state.mobileMode ? 0.72 : 1.6);
   attack += metric.softness * 0.06 + metric.distance * 0.04;
-  attack *= scanTone.attack;
+  attack *= scanTone.attack * (0.82 + cv.sustain * 0.22 - cv.transient * 0.18);
   let duration = Math.max(0.18, release * (0.58 + power * 0.58 + metric.distance * 0.32));
-  duration = Math.min(duration * scaleBehavior.decay * scanTone.release, 1.28 + metric.atmosphere * 0.42 + scaleBehavior.decay * 0.22);
+  duration = Math.min(duration * scaleBehavior.decay * scanTone.release * scanTone.cvRelease, 1.28 + metric.atmosphere * 0.42 + scaleBehavior.decay * 0.22 + cv.drone * 0.72);
   if (event.scan === "ascii") {
     duration = Math.min(2.6, Math.max(0.08, duration * symbolic.release));
     attack *= symbolic.attack;
@@ -3615,15 +3863,15 @@ function playEvent(event, time) {
   registerVoice(duration);
   const transparency = 0.42 + metric.emptiness * 0.26 + metric.overexposure * 0.16;
   const mobileLift = state.mobileMode ? 1.85 : 1;
-  const amp = (0.012 + power * 0.052) * timbre.amp * scanTone.amp * (0.82 + metric.density * 0.34) * mobileLift;
-  const cutoff = Number(controls.cutoff.value) * (0.44 + power * 0.82 + metric.overexposure * 0.38) * timbre.cutoff * scanTone.cutoff;
+  const amp = (0.009 + power * 0.042) * timbre.amp * scanTone.amp * (0.66 + cv.pressure * 0.42 + cv.transient * 0.16) * mobileLift;
+  const cutoff = Number(controls.cutoff.value) * (0.34 + power * 0.5 + metric.overexposure * 0.24 + cv.air * 0.34 + cv.transient * 0.2) * timbre.cutoff * scanTone.cutoff;
   const glide = Number(controls.glide.value);
   const grindAmount = 0;
   const detune = (event.edge - 0.5) * (8 + glide * 0.28 + metric.complexity * 12) + timbre.detune + metric.distance * 4 + pitchInfo.cents;
 
   filter.type = "lowpass";
   filter.frequency.setValueAtTime(Math.min(12000, cutoff), time);
-  filter.Q.setValueAtTime(Number(controls.resonance.value) * (0.18 + power * 0.08 + metric.complexity * 0.08) + timbre.resonance * 0.55 + scaleBehavior.resonance * 2.2 + scanTone.resonance, time);
+  filter.Q.setValueAtTime(Number(controls.resonance.value) * (0.14 + power * 0.06 + cv.resonance * 0.18) + timbre.resonance * 0.45 + scaleBehavior.resonance * (1.2 + cv.resonance * 1.4) + scanTone.resonance, time);
   grind.curve = makeDistortionCurve((grindAmount * 0.25) + (power * grindAmount * 0.75));
   grind.oversample = "4x";
   grindFilter.type = "bandpass";
@@ -3632,7 +3880,7 @@ function playEvent(event, time) {
   preGain.gain.setValueAtTime(1 + grindAmount * 5.5 + event.dark * grindAmount * 4, time);
   cleanMix.gain.setValueAtTime(Math.max(0.24, transparency - grindAmount * 0.48), time);
   grindMix.gain.setValueAtTime(grindAmount * (0.08 + power * 0.12), time);
-  pan.pan.setValueAtTime((event.x * 2 - 1) * (0.36 + metric.distance * 0.5) * scanTone.pan + Math.sin(event.y * 19 + time) * scaleBehavior.cyclic * 0.18, time);
+  pan.pan.setValueAtTime((event.x * 2 - 1) * (0.24 + cv.width * 0.62) * scanTone.pan + Math.sin(event.y * 19 + time) * scaleBehavior.cyclic * 0.18, time);
   gain.gain.setValueAtTime(0.0001, time);
   gain.gain.exponentialRampToValueAtTime(amp, time + Math.max(0.004, attack));
   gain.gain.exponentialRampToValueAtTime(0.0001, time + duration);
@@ -3894,6 +4142,7 @@ function frequencyForEvent(event, time = 0) {
 function updateEffects() {
   if (!state.audio || !state.spatial) return;
   const metric = state.imageMetrics;
+  const cv = state.cv;
   const spatial = state.spatial;
   const scan = controls.viewMode.value;
   const resolution = Number(controls.grain.value) / 18;
@@ -3905,20 +4154,20 @@ function updateEffects() {
   const air = Number(controls.reverb.value) / 100;
   const memory = Number(controls.feedback.value) / 86;
   const topology = spatialTopology(scan, metric);
-  const roomSize = clamp01(topology.roomSize + metric.emptiness * 0.28 + metric.distance * 0.22 + air * 0.24 - metric.density * 0.12);
-  const reflectionDensity = clamp01(topology.reflectionDensity + resolution * 0.22 + metric.complexity * 0.24);
-  const decayTopology = clamp01(topology.decay + memory * 0.34 + air * 0.24 - erosion * 0.1);
-  const width = clamp01(topology.width + metric.directionality * 0.24 + gravity * 0.1);
-  const clustering = clamp01(topology.clustering + resonance * 0.28 + metric.density * 0.22);
-  const diffusion = clamp01(topology.diffusion + fold * 0.28 + metric.softness * 0.16);
-  const damping = clamp01(topology.damping + (1 - air) * 0.28 + metric.darkness * 0.18);
-  const fragmentation = clamp01(topology.fragmentation + (1 - erosion) * 0.18 + metric.complexity * 0.18);
+  const roomSize = clamp01(topology.roomSize + cv.air * 0.28 + metric.distance * 0.16 + air * 0.18 - cv.pressure * 0.1);
+  const reflectionDensity = clamp01(topology.reflectionDensity + resolution * 0.14 + cv.resonance * 0.34 + cv.transient * 0.1);
+  const decayTopology = clamp01(topology.decay + memory * 0.22 + air * 0.18 + cv.sustain * 0.3 + cv.drone * 0.22 - erosion * 0.08);
+  const width = clamp01(topology.width + cv.width * 0.36 + metric.directionality * 0.14 + gravity * 0.08);
+  const clustering = clamp01(topology.clustering + resonance * 0.18 + cv.resonance * 0.34 + cv.pressure * 0.14);
+  const diffusion = clamp01(topology.diffusion + fold * 0.18 + cv.grain * 0.22 + cv.air * 0.12);
+  const damping = clamp01(topology.damping + (1 - air) * 0.2 + metric.darkness * 0.12 + cv.silence * 0.18);
+  const fragmentation = clamp01(topology.fragmentation + cv.grain * 0.38 + cv.transient * 0.16 + (1 - erosion) * 0.1);
   const now = state.audio.currentTime;
 
   if (state.granularBus) {
-    state.granularBus.gain.setTargetAtTime(controls.granularMute.checked ? 0.0001 : 1, now, 0.035);
+    state.granularBus.gain.setTargetAtTime(controls.granularMute.checked ? 0.0001 : 0.42 + cv.grain * 0.72, now, 0.09);
   }
-  spatial.input.gain.setTargetAtTime(0.42 + resonance * 0.36, now, 0.04);
+  spatial.input.gain.setTargetAtTime(0.26 + resonance * 0.22 + cv.resonance * 0.28, now, 0.08);
   spatial.earlyInput.gain.setTargetAtTime((0.12 + reflectionDensity * 0.42) * (state.mobileMode ? 0.72 : 1), now, 0.06);
   spatial.lateInput.gain.setTargetAtTime((0.18 + decayTopology * 0.48) * (state.mobileMode ? 0.62 : 1), now, 0.06);
   spatial.earlyReturn.gain.setTargetAtTime(0.08 + reflectionDensity * 0.22 + fragmentation * 0.08, now, 0.08);
@@ -3998,7 +4247,7 @@ function updateReadouts() {
       : `${(Number(controls.cutoff.value) / 1000).toFixed(1)} kHz / air ${atmosphere}`;
   readouts.space.textContent = `${distance} burn / ${controls.voices.value} resonance`;
   readouts.granular.textContent = controls.granular.checked
-    ? `${controls.granularMute.checked ? "muted" : `${controls.granularDensity.value} grains`} / ${controls.granularLevel.value} level`
+    ? `${controls.granularMute.checked ? "muted" : `${controls.granularDensity.value} grains`} / cv ${Math.round(state.cv.grain * 100)}`
     : "off";
   const audioState = state.audio?.state || state.audioState || "none";
   readouts.perform.textContent = [
@@ -4023,7 +4272,7 @@ function syncPlayButtonLabel() {
   }
   playButton.classList.remove("is-playing");
   const needsGesture = !state.audio || state.audio.state !== "running" || !state.audioUnlocked;
-  playButton.textContent = needsGesture ? "tap audio" : "play";
+  playButton.textContent = needsGesture ? "audio" : "play";
 }
 
 function clearScore() {
@@ -4051,6 +4300,8 @@ function clearScore() {
   state.events = [];
   state.layerEvents = {};
   state.triggers = [];
+  state.symbolCooldown.clear();
+  resetCvFields();
   state.playhead = 0;
   emptyState.classList.remove("is-hidden");
   updateReadouts();
