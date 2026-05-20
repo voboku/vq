@@ -117,11 +117,14 @@ const state = {
   lastSourceStopped: "none",
   lastAudioError: "none",
   lastPlayGestureAt: 0,
+  lastRecordGestureAt: 0,
   lastTestGestureAt: 0,
   lastHardUnlockAt: 0,
   graphNodes: [],
   lastAudioCheck: 0,
   recoveredErrors: 0,
+  pendingPlayAfterUnlock: false,
+  lastGestureType: "none",
   audioUnlocked: false,
   audioState: "none",
   audio: null,
@@ -139,7 +142,14 @@ const state = {
   sampleLoading: false,
   recorder: null,
   recordDestination: null,
+  recordInput: null,
+  recordProcessor: null,
+  recordSilent: null,
   recordChunks: [],
+  recordLeftChunks: [],
+  recordRightChunks: [],
+  recordLength: 0,
+  recordingSampleRate: 44100,
   pendingAudioBlob: null,
   pendingAudioName: "",
   isRecording: false,
@@ -2073,6 +2083,19 @@ function isMobileAudioDevice() {
   return isIOSLike() || /Android/i.test(navigator.userAgent);
 }
 
+function logAudioDebug(label, detail = {}) {
+  const payload = {
+    audioState: state.audio?.state || state.audioState || "none",
+    unlocked: state.audioUnlocked,
+    contextId: state.audioContextId || 0,
+    outputReady: state.outputReady,
+    masterConnected: state.masterConnected,
+    gesture: state.lastGestureType,
+    ...detail
+  };
+  console.log(`[otoge audio] ${label}`, payload);
+}
+
 function applyAudioPerformanceProfile() {
   state.mobileMode = isMobileAudioDevice();
   state.maxVoices = state.mobileMode ? 24 : 58;
@@ -2152,6 +2175,7 @@ function createAudioContext() {
   }
   state.audioContextId += 1;
   state.audioState = state.audio.state;
+  logAudioDebug("context created");
   return state.audio;
 }
 
@@ -2214,6 +2238,7 @@ function rebuildAudioGraph() {
   master.connect(compressor).connect(audio.destination);
   if (state.isRecording && state.recordDestination && state.recordDestination.context === audio) {
     compressor.connect(state.recordDestination);
+    if (state.recordInput && state.recordInput.context === audio) compressor.connect(state.recordInput);
   }
 
   state.master = master;
@@ -2254,7 +2279,9 @@ function rebuildAudioGraph() {
   state.audioState = audio.state;
   updateEffects();
   updateReadouts();
-  return verifyGraphContext();
+  const valid = verifyGraphContext();
+  logAudioDebug("graph rebuilt", { valid });
+  return valid;
 }
 
 function verifyGraphContext() {
@@ -2362,6 +2389,20 @@ function timestampLabel() {
   return new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
 }
 
+function compactTimestampLabel() {
+  const now = new Date();
+  const pad = (value) => String(value).padStart(2, "0");
+  return [
+    now.getFullYear(),
+    pad(now.getMonth() + 1),
+    pad(now.getDate())
+  ].join("") + "-" + [
+    pad(now.getHours()),
+    pad(now.getMinutes()),
+    pad(now.getSeconds())
+  ].join("");
+}
+
 function saveImageCapture() {
   render();
   const filename = `otoge-score-${timestampLabel()}.png`;
@@ -2379,7 +2420,166 @@ function saveImageCapture() {
   saveBlobToDevice(new Blob([bytes], { type: "image/png" }), filename);
 }
 
-async function toggleRecording() {
+function disconnectRecordingTap() {
+  try {
+    if (state.compressor && state.recordDestination) state.compressor.disconnect(state.recordDestination);
+  } catch (error) {
+    // Already disconnected.
+  }
+  try {
+    if (state.compressor && state.recordInput) state.compressor.disconnect(state.recordInput);
+  } catch (error) {
+    // Already disconnected.
+  }
+  [state.recordInput, state.recordProcessor, state.recordSilent].forEach((node) => {
+    try {
+      node?.disconnect();
+    } catch (error) {
+      // Already disconnected.
+    }
+  });
+  if (state.recordProcessor) state.recordProcessor.onaudioprocess = null;
+  state.recordDestination = null;
+  state.recordInput = null;
+  state.recordProcessor = null;
+  state.recordSilent = null;
+}
+
+function createWavRecordingTap() {
+  const audio = state.audio;
+  if (!audio || audio.state !== "running" || !state.compressor) return false;
+  if (typeof audio.createScriptProcessor !== "function") {
+    state.lastAudioError = "wav recorder unavailable";
+    return false;
+  }
+  disconnectRecordingTap();
+  state.recordDestination = audio.createMediaStreamDestination();
+  state.recordInput = audio.createGain();
+  state.recordProcessor = audio.createScriptProcessor(2048, 2, 2);
+  state.recordSilent = audio.createGain();
+  state.recordSilent.gain.value = 0;
+  state.recordLeftChunks = [];
+  state.recordRightChunks = [];
+  state.recordLength = 0;
+  state.recordingSampleRate = audio.sampleRate || 44100;
+
+  state.recordProcessor.onaudioprocess = (event) => {
+    if (!state.isRecording) return;
+    const input = event.inputBuffer;
+    const left = input.getChannelData(0);
+    const right = input.numberOfChannels > 1 ? input.getChannelData(1) : left;
+    state.recordLeftChunks.push(new Float32Array(left));
+    state.recordRightChunks.push(new Float32Array(right));
+    state.recordLength += left.length;
+  };
+
+  state.compressor.connect(state.recordDestination);
+  state.compressor.connect(state.recordInput);
+  state.recordInput.connect(state.recordProcessor);
+  state.recordProcessor.connect(state.recordSilent);
+  state.recordSilent.connect(audio.destination);
+  return true;
+}
+
+function mergeFloatChunks(chunks, length) {
+  const merged = new Float32Array(length);
+  let offset = 0;
+  chunks.forEach((chunk) => {
+    merged.set(chunk, offset);
+    offset += chunk.length;
+  });
+  return merged;
+}
+
+function floatToInt16Sample(value) {
+  const sample = Math.max(-1, Math.min(1, value));
+  return sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+}
+
+function encodeWav(left, right, sampleRate) {
+  const length = Math.min(left.length, right.length);
+  const dataSize = length * 4;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+
+  const writeString = (offset, string) => {
+    for (let i = 0; i < string.length; i += 1) {
+      view.setUint8(offset + i, string.charCodeAt(i));
+    }
+  };
+
+  writeString(0, "RIFF");
+  view.setUint32(4, 36 + dataSize, true);
+  writeString(8, "WAVE");
+  writeString(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 2, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 4, true);
+  view.setUint16(32, 4, true);
+  view.setUint16(34, 16, true);
+  writeString(36, "data");
+  view.setUint32(40, dataSize, true);
+
+  let offset = 44;
+  for (let i = 0; i < length; i += 1) {
+    view.setInt16(offset, floatToInt16Sample(left[i]), true);
+    view.setInt16(offset + 2, floatToInt16Sample(right[i]), true);
+    offset += 4;
+  }
+  return new Blob([view], { type: "audio/wav" });
+}
+
+function finishWavRecording() {
+  const length = state.recordLength;
+  const sampleRate = state.recordingSampleRate || state.audio?.sampleRate || 44100;
+  const left = mergeFloatChunks(state.recordLeftChunks, length);
+  const right = mergeFloatChunks(state.recordRightChunks, length);
+  const blob = length > 0 ? encodeWav(left, right, sampleRate) : null;
+  disconnectRecordingTap();
+  state.recordLeftChunks = [];
+  state.recordRightChunks = [];
+  state.recordLength = 0;
+  state.isRecording = false;
+  controls.record?.classList.remove("is-active");
+
+  if (blob?.size) {
+    state.pendingAudioBlob = blob;
+    state.pendingAudioName = `recording-${compactTimestampLabel()}.wav`;
+    if (controls.record) controls.record.textContent = "save";
+    state.lastRouteTest = "wav ready";
+  } else {
+    if (controls.record) controls.record.textContent = "record";
+    state.lastAudioError = "empty recording";
+  }
+  updateReadouts();
+}
+
+async function startWavRecording(event) {
+  if (event) hardUnlockAudioFromGesture(event);
+  const ok = await ensureAudio();
+  if (!ok || state.audio?.state !== "running") {
+    state.lastAudioError = "audio not running";
+    updateReadouts();
+    return;
+  }
+  if (!state.compressor || !state.masterConnected) rebuildAudioGraph();
+  if (!createWavRecordingTap()) {
+    state.lastAudioError = "record route failed";
+    updateReadouts();
+    return;
+  }
+  state.isRecording = true;
+  state.pendingAudioBlob = null;
+  state.pendingAudioName = "";
+  controls.record?.classList.add("is-active");
+  if (controls.record) controls.record.textContent = "stop";
+  state.lastRouteTest = "wav recording";
+  updateReadouts();
+}
+
+async function toggleRecording(event) {
   if (state.pendingAudioBlob) {
     await savePendingAudio();
     return;
@@ -2388,84 +2588,25 @@ async function toggleRecording() {
     stopRecording();
     return;
   }
-  const ok = await ensureAudio();
-  if (!ok || typeof MediaRecorder === "undefined") {
-    state.lastAudioError = "record unavailable";
-    updateReadouts();
-    return;
-  }
-  state.recordDestination = state.audio.createMediaStreamDestination();
-  state.recordChunks = [];
-  if (state.compressor) state.compressor.connect(state.recordDestination);
-  const mimeType = [
-    "audio/webm;codecs=opus",
-    "audio/webm",
-    "audio/mp4"
-  ].find((type) => MediaRecorder.isTypeSupported(type)) || "";
-  const recorderOptions = mimeType ? { mimeType } : undefined;
-  try {
-    state.recorder = new MediaRecorder(state.recordDestination.stream, recorderOptions);
-  } catch (error) {
-    try {
-      state.recorder = new MediaRecorder(state.recordDestination.stream);
-    } catch (fallbackError) {
-      markAudioError(fallbackError);
-      state.recordDestination = null;
-      updateReadouts();
-      return;
-    }
-  }
-  state.recorder.addEventListener("dataavailable", (event) => {
-    if (event.data && event.data.size) state.recordChunks.push(event.data);
-  });
-  state.recorder.addEventListener("stop", () => {
-    const type = state.recorder?.mimeType || mimeType;
-    const blob = new Blob(state.recordChunks, { type });
-    state.recordChunks = [];
-    const extension = type.includes("mp4") ? "m4a" : "webm";
-    if (blob.size) {
-      const filename = `otoge-audio-${timestampLabel()}.${extension}`;
-      if (isIOSLike()) {
-        state.pendingAudioBlob = blob;
-        state.pendingAudioName = filename;
-      } else {
-        saveBlobToDevice(blob, filename);
-      }
-    }
-    try {
-      if (state.compressor && state.recordDestination) state.compressor.disconnect(state.recordDestination);
-    } catch (error) {
-      // Already disconnected.
-    }
-    state.recordDestination = null;
-    state.recorder = null;
-    state.isRecording = false;
-    controls.record?.classList.remove("is-active");
-    if (controls.record) controls.record.textContent = state.pendingAudioBlob ? "save" : "record";
-    updateReadouts();
-  });
-  state.recorder.start(isSafariLike() ? 1000 : undefined);
-  state.isRecording = true;
-  controls.record?.classList.add("is-active");
-  if (controls.record) controls.record.textContent = "stop";
-  updateReadouts();
+  await startWavRecording(event);
+}
+
+function handleRecordGesture(event) {
+  if (event?.cancelable) event.preventDefault();
+  if (performance.now() - state.lastRecordGestureAt < 550) return;
+  state.lastRecordGestureAt = performance.now();
+  toggleRecording(event);
 }
 
 function stopRecording() {
-  if (state.recorder && state.recorder.state !== "inactive") {
-    try {
-      state.recorder.requestData?.();
-    } catch (error) {
-      // Safari may throw if no data is ready yet.
-    }
-    state.recorder.stop();
-  }
+  if (!state.isRecording) return;
+  finishWavRecording();
 }
 
 async function savePendingAudio() {
   if (!state.pendingAudioBlob) return;
   const blob = state.pendingAudioBlob;
-  const filename = state.pendingAudioName || `otoge-audio-${timestampLabel()}.webm`;
+  const filename = state.pendingAudioName || `recording-${compactTimestampLabel()}.wav`;
   const saved = await saveBlobToDevice(blob, filename);
   if (saved || !isIOSLike()) {
     state.pendingAudioBlob = null;
@@ -2491,6 +2632,7 @@ async function verifyOutputRoute() {
     const secondaryOk = playRouteProbe(secondaryDestination, state.mobileMode ? "granular" : "spatial", state.mobileMode ? 0.012 : 0.008);
     state.outputReady = masterOk && secondaryOk;
     state.lastRouteTest = state.outputReady ? (state.mobileMode ? "mobile safe" : "master + spatial") : "route failed";
+    logAudioDebug("route verified", { masterOk, secondaryOk });
     updateReadouts();
     return state.outputReady;
   } catch (error) {
@@ -2515,18 +2657,25 @@ function playDirectUnlockBeep(audio) {
   oscillator.stop(now + 0.18);
   cleanupNodes([oscillator, gain], 0.28);
   state.lastSourceStarted = "direct";
+  logAudioDebug("first sound triggered", { direct: true });
   window.setTimeout(() => {
     state.lastSourceStopped = "direct";
     updateReadouts();
   }, 240);
 }
 
-function hardUnlockAudioFromGesture(event) {
+function hardUnlockAudioFromGesture(event, options = {}) {
   if (event?.cancelable) event.preventDefault();
   applyAudioPerformanceProfile();
+  state.lastGestureType = event?.type || "unknown";
+  logAudioDebug("user gesture received", { type: state.lastGestureType });
   const nowMs = performance.now();
-  if (nowMs - state.lastHardUnlockAt < 180 && state.audio) return state.audio.state === "running";
+  if (nowMs - state.lastHardUnlockAt < 180 && state.audio) {
+    if (options.startAfterUnlock && state.audio.state === "running" && state.outputReady) beginPlayback();
+    return state.audio.state === "running";
+  }
   state.lastHardUnlockAt = nowMs;
+  state.pendingPlayAfterUnlock = Boolean(options.startAfterUnlock);
 
   const AudioContextClass = window.AudioContext || window.webkitAudioContext;
   if (!AudioContextClass) {
@@ -2557,11 +2706,16 @@ function hardUnlockAudioFromGesture(event) {
       state.audioState = audio.state;
       state.audioUnlocked = audio.state === "running";
       if (audio.state === "running") {
+        logAudioDebug("resume success");
         rebuildAudioGraph();
-        verifyOutputRoute();
+        Promise.resolve(verifyOutputRoute()).then(() => {
+          if (state.pendingPlayAfterUnlock) beginPlayback();
+          state.pendingPlayAfterUnlock = false;
+        });
       } else {
         state.outputReady = false;
         state.lastRouteTest = "unlock suspended";
+        logAudioDebug("resume incomplete");
       }
       updateReadouts();
     };
@@ -2570,6 +2724,7 @@ function hardUnlockAudioFromGesture(event) {
       audio.resume().then(finishUnlock).catch((error) => {
         markAudioError(error);
         state.audioState = audio.state;
+        logAudioDebug("resume failure", { error: state.lastAudioError });
         updateReadouts();
       });
     } else {
@@ -2579,6 +2734,7 @@ function hardUnlockAudioFromGesture(event) {
   } catch (error) {
     markAudioError(error);
     state.audioState = audio.state;
+    logAudioDebug("unlock failure", { error: state.lastAudioError });
     updateReadouts();
     return false;
   }
@@ -2854,20 +3010,18 @@ function makeNoiseBuffer(audio) {
   return buffer;
 }
 
-async function togglePlay() {
-  if (state.isPlaying) {
-    stop();
-    return;
-  }
+function beginPlayback() {
+  if (state.isPlaying) return true;
   if (!state.imageData) {
     fileInput.click();
-    return;
+    return false;
   }
-  const unlocked = await unlockAudioFromGesture();
-  if (!unlocked || state.audio?.state !== "running") {
+  if (!state.audio || state.audio.state !== "running" || !state.outputReady) {
     state.audioState = state.audio?.state || "none";
+    state.lastRouteTest = state.audio?.state === "running" ? "route pending" : "tap to enable";
+    logAudioDebug("play blocked", { reason: state.lastRouteTest });
     updateReadouts();
-    return;
+    return false;
   }
   state.isPlaying = true;
   const timelinePosition = controls.reverse.checked ? 1 - state.playhead : state.playhead;
@@ -2877,22 +3031,46 @@ async function togglePlay() {
   playMobileStartProbe();
   playButton.textContent = "stop";
   playButton.classList.add("is-playing");
+  logAudioDebug("playback started");
   animate();
+  return true;
+}
+
+async function togglePlay(event) {
+  if (state.isPlaying) {
+    stop();
+    return;
+  }
+  if (!state.imageData) {
+    fileInput.click();
+    return;
+  }
+  if (event) {
+    hardUnlockAudioFromGesture(event, { startAfterUnlock: true });
+    return;
+  }
+  const unlocked = await unlockAudioFromGesture();
+  if (!unlocked || state.audio?.state !== "running") {
+    state.audioState = state.audio?.state || "none";
+    updateReadouts();
+    return;
+  }
+  beginPlayback();
 }
 
 function handlePlayButtonGesture(event) {
   if (event?.cancelable) event.preventDefault();
-  if (performance.now() - state.lastPlayGestureAt < 500) return;
+  if (performance.now() - state.lastPlayGestureAt < 450) return;
   state.lastPlayGestureAt = performance.now();
-  togglePlay();
+  togglePlay(event);
 }
 
 function stop() {
   state.isPlaying = false;
-  playButton.textContent = "play";
-  playButton.classList.remove("is-playing");
   state.mobileStartProbe = false;
+  syncPlayButtonLabel();
   cancelAnimationFrame(state.animation);
+  logAudioDebug("playback stopped");
   render();
 }
 
@@ -3833,6 +4011,19 @@ function updateReadouts() {
     state.isRecording ? "recording" : state.pendingAudioBlob ? "audio ready" : state.lastAudioError !== "none" ? `err ${state.lastAudioError}` : controls.synthMute.checked ? "muted" : "sound"
   ].join(" · ");
   readouts.scan.textContent = controls.reverse.checked ? "right → left" : "left → right";
+  syncPlayButtonLabel();
+}
+
+function syncPlayButtonLabel() {
+  if (!playButton) return;
+  if (state.isPlaying) {
+    playButton.textContent = "stop";
+    playButton.classList.add("is-playing");
+    return;
+  }
+  playButton.classList.remove("is-playing");
+  const needsGesture = !state.audio || state.audio.state !== "running" || !state.audioUnlocked;
+  playButton.textContent = needsGesture ? "tap audio" : "play";
 }
 
 function clearScore() {
@@ -3867,19 +4058,14 @@ function clearScore() {
 }
 
 loadButton.addEventListener("click", () => fileInput.click());
-playButton.addEventListener("pointerdown", hardUnlockAudioFromGesture, { passive: false });
-playButton.addEventListener("pointerup", handlePlayButtonGesture, { passive: false });
-playButton.addEventListener("touchstart", hardUnlockAudioFromGesture, { passive: false });
-playButton.addEventListener("touchend", handlePlayButtonGesture, { passive: false });
-playButton.addEventListener("mousedown", () => {
-  primeAudioFromGesture();
-});
+playButton.addEventListener("pointerdown", handlePlayButtonGesture, { passive: false });
+playButton.addEventListener("touchstart", handlePlayButtonGesture, { passive: false });
 playButton.addEventListener("click", (event) => {
   if (performance.now() - state.lastPlayGestureAt < 700) {
     event.preventDefault();
     return;
   }
-  togglePlay();
+  handlePlayButtonGesture(event);
 });
 if (routeTestButton) {
   routeTestButton.addEventListener("pointerdown", hardUnlockAudioFromGesture, { passive: false });
@@ -3898,7 +4084,15 @@ if (routeTestButton) {
 clearButton.addEventListener("click", clearScore);
 sampleLoadButton.addEventListener("click", () => sampleInput.click());
 controls.saveImage?.addEventListener("click", saveImageCapture);
-controls.record?.addEventListener("click", toggleRecording);
+controls.record?.addEventListener("pointerdown", handleRecordGesture, { passive: false });
+controls.record?.addEventListener("touchstart", handleRecordGesture, { passive: false });
+controls.record?.addEventListener("click", (event) => {
+  if (performance.now() - state.lastRecordGestureAt < 700) {
+    event.preventDefault();
+    return;
+  }
+  handleRecordGesture(event);
+});
 fileInput.addEventListener("change", (event) => loadFile(event.target.files[0]));
 sampleInput.addEventListener("change", (event) => {
   loadSampleFile(event.target.files[0]);
