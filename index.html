@@ -128,11 +128,10 @@
           <label class="select-row">
             <span>scan</span>
             <select id="viewMode">
-              <option value="normal" selected>normal</option>
+              <option value="ascii" selected>ascii</option>
+              <option value="normal">normal</option>
               <option value="field">field</option>
-              <option value="colorTrace">color trace</option>
               <option value="xray">x-ray</option>
-              <option value="ascii">ascii</option>
             </select>
           </label>
         </div>
@@ -327,19 +326,19 @@
           </label>
           <label class="control-row">
             <span>level</span>
-            <input id="granularLevelControl" type="range" min="0" max="100" value="36">
+            <input id="granularLevelControl" type="range" min="0" max="120" value="52">
           </label>
           <label class="control-row">
             <span>size</span>
-            <input id="granularSizeControl" type="range" min="8" max="260" value="86">
+            <input id="granularSizeControl" type="range" min="8" max="420" value="116">
           </label>
           <label class="control-row">
             <span>density</span>
-            <input id="granularDensityControl" type="range" min="1" max="6" value="2">
+            <input id="granularDensityControl" type="range" min="1" max="12" value="4">
           </label>
           <label class="control-row">
             <span>spray</span>
-            <input id="granularSprayControl" type="range" min="0" max="100" value="38">
+            <input id="granularSprayControl" type="range" min="0" max="140" value="54">
           </label>
           <label class="control-row">
             <span>pitch</span>
@@ -377,6 +376,10 @@
             <input id="marksControl" type="checkbox" checked>
             <span>marks</span>
           </label>
+          <div class="perform-actions">
+            <button id="saveImageButton" class="paper-button" type="button">save image</button>
+            <button id="recordButton" class="paper-button" type="button">record</button>
+          </div>
         </div>
       </aside>
     </main>

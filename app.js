@@ -7,6 +7,7 @@ const sampleInput = document.querySelector("#sampleInput");
 const dropZone = document.querySelector("#dropZone");
 const emptyState = document.querySelector("#emptyState");
 const playButton = document.querySelector("#playButton");
+const routeTestButton = document.querySelector("#routeTestButton");
 const loadButton = document.querySelector("#loadButton");
 const clearButton = document.querySelector("#clearButton");
 const sampleLoadButton = document.querySelector("#sampleLoadButton");
@@ -54,7 +55,9 @@ const controls = {
   loop: document.querySelector("#loopControl"),
   reverse: document.querySelector("#reverseControl"),
   trace: document.querySelector("#traceControl"),
-  marks: document.querySelector("#marksControl")
+  marks: document.querySelector("#marksControl"),
+  saveImage: document.querySelector("#saveImageButton"),
+  record: document.querySelector("#recordButton")
 };
 
 const readouts = {
@@ -76,10 +79,11 @@ const state = {
   originalImageData: null,
   gray: [],
   edges: [],
+  ascii: null,
   maps: {},
   layerStats: {},
   imageSignature: null,
-  activeLayer: "field",
+  activeLayer: "ascii",
   colors: [],
   colorProfile: null,
   imageMetrics: {
@@ -103,6 +107,19 @@ const state = {
   maxVoices: 58,
   mobileMode: false,
   frameEventCap: 6,
+  mobileStartProbe: false,
+  audioContextId: 0,
+  graphContextId: 0,
+  masterConnected: false,
+  outputReady: false,
+  lastRouteTest: "none",
+  lastSourceStarted: "none",
+  lastSourceStopped: "none",
+  lastAudioError: "none",
+  lastPlayGestureAt: 0,
+  lastTestGestureAt: 0,
+  lastHardUnlockAt: 0,
+  graphNodes: [],
   lastAudioCheck: 0,
   recoveredErrors: 0,
   audioUnlocked: false,
@@ -110,6 +127,7 @@ const state = {
   audio: null,
   master: null,
   granularBus: null,
+  compressor: null,
   delay: null,
   delayGain: null,
   feedbackGain: null,
@@ -119,6 +137,12 @@ const state = {
   noiseBuffer: null,
   sample: null,
   sampleLoading: false,
+  recorder: null,
+  recordDestination: null,
+  recordChunks: [],
+  pendingAudioBlob: null,
+  pendingAudioName: "",
+  isRecording: false,
   triggers: [],
   imageRect: null,
   animation: 0
@@ -184,6 +208,18 @@ const keyOffsets = {
 };
 
 const glyphs = [" ", ".", ":", "-", "=", "+", "*", "#", "%", "@"];
+const glyphProfiles = {
+  " ": { family: "air", voice: "choir", amp: 0.12, release: 2.2, attack: 2.4, resonance: 0.8, density: 0.02, pitch: -0.2 },
+  ".": { family: "dust", voice: "pluck", amp: 0.3, release: 0.32, attack: 0.18, resonance: 0.15, density: 0.26, pitch: 0.32 },
+  ":": { family: "glass", voice: "bell", amp: 0.42, release: 0.42, attack: 0.12, resonance: 0.36, density: 0.34, pitch: 0.22 },
+  "-": { family: "line", voice: "sine", amp: 0.52, release: 1.18, attack: 0.84, resonance: 0.28, density: 0.5, pitch: 0.02 },
+  "=": { family: "resonance", voice: "dual", amp: 0.62, release: 1.55, attack: 1.0, resonance: 0.62, density: 0.6, pitch: -0.02 },
+  "+": { family: "bloom", voice: "cluster", amp: 0.72, release: 1.34, attack: 0.72, resonance: 0.88, density: 0.68, pitch: 0.1 },
+  "*": { family: "grain", voice: "fm", amp: 0.66, release: 0.72, attack: 0.42, resonance: 0.7, density: 0.76, pitch: 0.18 },
+  "#": { family: "metal", voice: "bell", amp: 0.82, release: 1.0, attack: 0.34, resonance: 1.12, density: 0.84, pitch: -0.08 },
+  "%": { family: "broken", voice: "fm", amp: 0.78, release: 0.86, attack: 0.28, resonance: 1.24, density: 0.9, pitch: 0.06 },
+  "@": { family: "mass", voice: "choir", amp: 0.92, release: 2.1, attack: 1.36, resonance: 1.45, density: 1, pitch: -0.22 }
+};
 
 function clamp01(value) {
   return Math.max(0, Math.min(1, value));
@@ -441,6 +477,23 @@ function dominantColorName(profile = state.colorProfile) {
   return Object.entries(profile).sort((a, b) => b[1] - a[1])[0]?.[0] || "neutral";
 }
 
+function isSafariLike() {
+  return /^((?!chrome|android|crios|fxios|edgios).)*safari/i.test(navigator.userAgent);
+}
+
+function isIOSLike() {
+  return /iPad|iPhone|iPod/i.test(navigator.userAgent)
+    || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+}
+
+function decodeAudioDataCompat(audio, arrayBuffer) {
+  const data = arrayBuffer.slice(0);
+  return new Promise((resolve, reject) => {
+    const result = audio.decodeAudioData(data, resolve, reject);
+    if (result?.then) result.then(resolve).catch(reject);
+  });
+}
+
 function loadFile(file) {
   if (!file || !file.type.startsWith("image/")) return;
   const reader = new FileReader();
@@ -465,7 +518,7 @@ async function loadSampleFile(file) {
   const reader = new FileReader();
   reader.onload = async () => {
     try {
-      const buffer = await state.audio.decodeAudioData(reader.result.slice(0));
+      const buffer = await decodeAudioDataCompat(state.audio, reader.result);
       state.sample = {
         name: file.name.replace(/\.[^.]+$/, "").slice(0, 26),
         buffer,
@@ -524,6 +577,7 @@ function analyzeImage() {
   const { data, width, height } = state.imageData;
   state.gray = new Float32Array(width * height);
   state.edges = new Float32Array(width * height);
+  state.ascii = new Uint8Array(width * height);
   state.colors = new Array(width * height);
   const colorProfile = { red: 0, yellow: 0, green: 0, cyan: 0, blue: 0, purple: 0, neutral: 0 };
   let graySum = 0;
@@ -653,17 +707,87 @@ function buildImageMaps(width, height) {
       maps.contour[i] = clamp01(strongContour * 0.72 + edgeRarity * 0.42 + localContrast * 0.18);
       maps.shadow[i] = clamp01(relativeDark * 0.74 + darkMass * relativeDark * 0.34 + tonalRarity * relativeDark * 0.22);
       maps.dust[i] = clamp01(localContrast * 0.86 * (1 - edgeMass * 0.66) + tonalRarity * isolated * 1.4);
-      maps.field[i] = clamp01(relativeBright * flatness * 0.92 + (1 - tonalRarity) * flatness * 0.26);
+      const fieldLine = fieldLineStrength(x, y, width, height, edgeStats.q50);
+      const nonPaper = clamp01(dark * 0.42 + edgeMass * 1.2 + localContrast * 0.34 + tonalRarity * 0.18);
+      const paperSilence = clamp01(relativeBright * flatness * (1 - edgeMass) * 1.05);
+      maps.field[i] = clamp01((fieldLine * 0.82 + strongContour * 0.22 + edgeMass * 0.18) * nonPaper * (1 - paperSilence * 0.58));
       maps.object[i] = clamp01(objectMass * 0.84 + edgeMass * tonalRarity * 0.24);
       maps.grain[i] = clamp01((localContrast * 0.72 + edgeRarity * 0.28) * (0.48 + seededWave(x * 0.37 + y * 0.91) * 0.34 + tonalRarity * 0.28));
       maps.colorTrace[i] = clamp01(colorDifference * (0.52 + color.value * 0.34) + edgeRarity * color.saturation * 0.22);
       maps.xray[i] = clamp01((1 - band) * 0.48 + tonalRarity * 0.34 + edgeRarity * 0.18 + flatness * relativeBright * 0.12);
       maps.normal[i] = maps.contour[i];
-      maps.ascii[i] = maps.contour[i];
+      const symbolicDensity = asciiDensityForPixel({
+        gray,
+        dark,
+        edge,
+        localContrast,
+        edgeMass,
+        tonalRarity,
+        colorDifference,
+        flatness
+      });
+      const glyphIndex = asciiGlyphIndex(symbolicDensity, flatness, color.saturation);
+      state.ascii[i] = glyphIndex;
+      maps.ascii[i] = clamp01(symbolicDensity * 0.72 + glyphIndex / (glyphs.length - 1) * 0.38);
     }
   }
 
   return maps;
+}
+
+function asciiDensityForPixel({ gray, dark, edge, localContrast, edgeMass, tonalRarity, colorDifference, flatness }) {
+  const density = dark * 0.52
+    + edge * 0.36
+    + localContrast * 0.34
+    + edgeMass * 0.22
+    + tonalRarity * 0.18
+    + colorDifference * 0.1
+    - flatness * gray * 0.22;
+  return clamp01(density);
+}
+
+function fieldLineStrength(x, y, width, height, edgeFloor = 0.04) {
+  const centerIndex = y * width + x;
+  const centerGray = state.gray[centerIndex] || 255;
+  const centerEdge = (state.edges[centerIndex] || 0) / 255;
+  if (centerGray > 248 && centerEdge < 0.035) return 0;
+  const axes = [
+    [1, 0],
+    [0, 1],
+    [1, 1],
+    [1, -1]
+  ];
+  let best = 0;
+  axes.forEach(([dx, dy]) => {
+    let count = 0;
+    [-1, 1].forEach((direction) => {
+      let misses = 0;
+      for (let step = 1; step <= 22; step += 1) {
+        const xx = x + dx * step * direction;
+        const yy = y + dy * step * direction;
+        if (xx < 1 || yy < 1 || xx >= width - 1 || yy >= height - 1) break;
+        const index = yy * width + xx;
+        const gray = state.gray[index] || 255;
+        const edge = (state.edges[index] || 0) / 255;
+        const tonalLine = Math.abs(gray - centerGray) > 9 && gray < 248;
+        const edgeLine = edge > Math.max(0.026, edgeFloor * 0.48);
+        if (edgeLine || tonalLine) {
+          count += 1;
+          misses = 0;
+        } else {
+          misses += 1;
+          if (misses > 3) break;
+        }
+      }
+    });
+    best = Math.max(best, count / 44);
+  });
+  return clamp01(best * (0.92 + centerEdge * 1.4));
+}
+
+function asciiGlyphIndex(value, flatness = 0, saturation = 0) {
+  const shaped = clamp01(value ** (0.82 + flatness * 0.18) + saturation * 0.045);
+  return Math.max(0, Math.min(glyphs.length - 1, Math.floor(shaped * glyphs.length)));
 }
 
 function measureImageSignature(width, height) {
@@ -750,7 +874,7 @@ function quantileSummary(values) {
 
 function measureLayerStats(maps, width, height) {
   const stats = {};
-  const layers = ["contour", "shadow", "dust", "field", "object", "grain", "colorTrace", "xray"];
+  const layers = ["ascii", "contour", "shadow", "dust", "field", "object", "grain", "colorTrace", "xray"];
   layers.forEach((layer) => {
     const map = maps[layer];
     let sum = 0;
@@ -837,12 +961,12 @@ function buildEvents() {
 }
 
 function analysisScan(mode) {
-  if (mode === "normal" || mode === "ascii") return "auto";
+  if (mode === "normal" || mode === "ascii") return "ascii";
   return mode;
 }
 
 function activeScanLayers() {
-  return ["field", "colorTrace", "xray"];
+  return ["ascii", "field", "xray"];
 }
 
 function dominantAnalysisLayer() {
@@ -850,11 +974,11 @@ function dominantAnalysisLayer() {
   const stats = state.layerStats || {};
   const colorStrength = Object.entries(state.colorProfile || {}).reduce((sum, [key, value]) => key === "neutral" ? sum : sum + value, 0);
   const candidates = {
-    field: (stats.field?.coverage || 0) * 0.9 + metric.emptiness * 1.35 + metric.overexposure * 0.72,
-    colorTrace: (stats.colorTrace?.average || 0) * 2.2 + colorStrength * 0.00008,
+    ascii: (stats.ascii?.coverage || 0) * 1.7 + (stats.ascii?.average || 0) * 2.6 + metric.complexity * 0.82 + metric.density * 0.4,
+    field: (stats.field?.coverage || 0) * 2.4 + (stats.field?.average || 0) * 3.2 + metric.complexity * 0.72,
     xray: (stats.xray?.peak || 0) * 0.94 + (stats.xray?.coverage || 0) * 0.28 + metric.softness * 0.12
   };
-  return Object.entries(candidates).sort((a, b) => b[1] - a[1])[0]?.[0] || "field";
+  return Object.entries(candidates).sort((a, b) => b[1] - a[1])[0]?.[0] || "ascii";
 }
 
 function collectEventsForScan(scan, width, height, step, threshold, detailBias) {
@@ -882,18 +1006,23 @@ function collectEventsForScan(scan, width, height, step, threshold, detailBias) 
       const scanValue = map[i] || 0;
       const accepted = scanValue > adaptive || scanFallback(scan, { edgeNorm, dark, bright, softPresence, color });
       if (accepted) {
+        const glyphIndex = state.ascii?.[i] || 0;
+        const glyph = glyphs[glyphIndex] || " ";
+        const symbolic = asciiLocalStructure(x, y, width, height, glyphIndex);
         const tonalRarity = clamp01(Math.abs(bright - q.q50) / tonalSpread);
         const colorRarity = color ? clamp01((color.saturation - (signature.color?.saturationMean || 0)) / 0.42) : 0;
         const localContrast = clamp01(Math.abs(bright - ((right + down) / 510)) / Math.max(0.035, signature.texture?.peak || 0.12));
         const orientation = (angle + Math.PI) / (Math.PI * 2);
-        const sourceStrength = clamp01(scanValue * 0.58 + tonalRarity * 0.18 + localContrast * 0.16 + colorRarity * 0.12);
+        const sourceStrength = clamp01(scanValue * 0.5 + tonalRarity * 0.14 + localContrast * 0.14 + colorRarity * 0.1 + symbolic.cluster * 0.16 + symbolic.isolated * 0.12);
         const pitchBias = scanPitchBias(scan, {
           tonalRarity,
           colorRarity,
           localContrast,
           orientation,
           bright,
-          dark
+          dark,
+          glyphIndex,
+          symbolic
         });
         events.push({
           x: x / width,
@@ -911,6 +1040,13 @@ function collectEventsForScan(scan, width, height, step, threshold, detailBias) 
           localContrast,
           orientation,
           pitchBias,
+          glyph,
+          glyphIndex,
+          symbolDensity: glyphIndex / (glyphs.length - 1),
+          symbolRun: symbolic.run,
+          symbolCluster: symbolic.cluster,
+          symbolIsolated: symbolic.isolated,
+          symbolSpace: symbolic.space,
           atmosphere: state.imageMetrics.atmosphere,
           distance: state.imageMetrics.distance
         });
@@ -919,22 +1055,56 @@ function collectEventsForScan(scan, width, height, step, threshold, detailBias) 
   }
 
   const maxEventsByScan = {
-    field: 1400,
+    ascii: 1800,
+    field: 1600,
     colorTrace: 1200,
     xray: 520
   };
-  const densityBoost = Number(controls.density.value) * (scan === "xray" ? 28 : 90);
-  const detailBoost = Number(controls.detail.value) * (scan === "xray" ? 32 : 140);
+  const densityBoost = Number(controls.density.value) * (scan === "xray" ? 28 : scan === "ascii" ? 120 : 90);
+  const detailBoost = Number(controls.detail.value) * (scan === "xray" ? 32 : scan === "ascii" ? 170 : 140);
   const maxEvents = Math.round((maxEventsByScan[scan] || 900) + detailBoost + densityBoost);
   return pruneEvents(events, maxEvents);
 }
 
+function asciiLocalStructure(x, y, width, height, glyphIndex) {
+  if (!state.ascii) return { run: 0, cluster: 0, isolated: 0, space: glyphIndex === 0 ? 1 : 0 };
+  let same = 0;
+  let active = 0;
+  let total = 0;
+  let run = 0;
+  for (let ox = -5; ox <= 5; ox += 1) {
+    const xx = Math.max(0, Math.min(width - 1, x + ox));
+    const index = y * width + xx;
+    if ((state.ascii[index] || 0) === glyphIndex) run += 1;
+  }
+  for (let oy = -2; oy <= 2; oy += 1) {
+    for (let ox = -2; ox <= 2; ox += 1) {
+      const xx = Math.max(0, Math.min(width - 1, x + ox));
+      const yy = Math.max(0, Math.min(height - 1, y + oy));
+      const value = state.ascii[yy * width + xx] || 0;
+      if (value === glyphIndex) same += 1;
+      if (value > 1) active += 1;
+      total += 1;
+    }
+  }
+  const cluster = active / Math.max(1, total);
+  const isolated = glyphIndex > 1 ? clamp01(1 - same / Math.max(1, total) + cluster * 0.12) : 0;
+  const space = glyphIndex <= 1 ? clamp01(1 - cluster) : 0;
+  return {
+    run: clamp01(run / 11),
+    cluster,
+    isolated,
+    space
+  };
+}
+
 function scanPitchBias(scan, event) {
   const table = {
+    ascii: (event.glyphIndex / (glyphs.length - 1) - 0.46) * 0.28 + (event.symbolRun || 0) * 0.08 - (event.symbolSpace || 0) * 0.12,
     contour: (event.orientation - 0.5) * 0.18 + event.localContrast * 0.06,
     shadow: -0.18 - event.dark * 0.08 + event.tonalRarity * 0.05,
     dust: 0.18 + event.localContrast * 0.12,
-    field: 0.12 + event.bright * 0.08,
+    field: (event.scanValue - 0.5) * 0.24 + event.orientation * 0.08,
     object: -0.08 + event.tonalRarity * 0.04,
     grain: (event.localContrast - 0.5) * 0.2,
     colorTrace: (event.colorRarity - 0.35) * 0.26,
@@ -947,7 +1117,8 @@ function adaptiveScanThreshold(scan, fallback) {
   const stat = state.layerStats?.[scan];
   if (!stat) return fallback;
   const strictness = {
-    field: 0.58,
+    ascii: 0.46,
+    field: 0.18,
     colorTrace: 0.5,
     xray: 0.72
   }[scan] ?? 0.52;
@@ -958,7 +1129,8 @@ function adaptiveScanThreshold(scan, fallback) {
 function scanThreshold(scan, threshold, detailBias) {
   const base = clamp01((threshold - detailBias) / 255);
   const table = {
-    field: 0.42,
+    ascii: 0.18,
+    field: 0.16,
     colorTrace: 0.18,
     xray: 0.66
   };
@@ -966,7 +1138,8 @@ function scanThreshold(scan, threshold, detailBias) {
 }
 
 function scanFallback(scan, event) {
-  if (scan === "field") return event.bright > 0.78 && event.edgeNorm < 0.14;
+  if (scan === "ascii") return event.dark > 0.16 || event.edgeNorm > 0.1 || event.color?.saturation > 0.24;
+  if (scan === "field") return false;
   if (scan === "colorTrace") return event.color && event.color.saturation > 0.18;
   if (scan === "xray") return event.edgeNorm > 0.34 && Math.abs(event.bright - 0.5) < 0.045;
   return false;
@@ -983,7 +1156,9 @@ function pruneEvents(events, maxEvents) {
     const bucketX = Math.floor(event.x * 180);
     const bucketY = Math.floor(event.y * 90);
     const key = `${bucketX}:${bucketY}`;
-    const score = event.edge * 0.62 + event.dark * 0.24 + (event.soft || 0) * 0.14;
+    const score = event.scan === "ascii"
+      ? (event.symbolDensity || 0) * 0.34 + (event.symbolCluster || 0) * 0.26 + (event.symbolIsolated || 0) * 0.22 + (event.symbolRun || 0) * 0.18
+      : event.edge * 0.62 + event.dark * 0.24 + (event.soft || 0) * 0.14;
     const current = buckets.get(key);
     if (!current || score > current.score) buckets.set(key, { event, score });
   }
@@ -1380,6 +1555,11 @@ function drawAnalysisMarker(x, y, source, alpha = 0.16, size = 4, phase = 0) {
   } else if (source === "colorTrace" || source === "color") {
     ctx.fillStyle = `rgba(116, 112, 91, ${alpha})`;
     ctx.fillRect(x - radius, y + radius * 0.8, radius * 2.4, Math.max(1, radius * 0.42));
+  } else if (source === "ascii" || source === "symbol") {
+    ctx.strokeStyle = `rgba(86, 92, 88, ${alpha * 0.8})`;
+    ctx.fillStyle = `rgba(236, 232, 202, ${alpha * 0.16})`;
+    ctx.fillRect(x - radius * 1.1, y - radius * 0.85, radius * 2.2, radius * 1.7);
+    ctx.strokeRect(x - radius * 1.1, y - radius * 0.85, radius * 2.2, radius * 1.7);
   } else if (source === "object" || source === "dual") {
     ctx.strokeStyle = `rgba(82, 88, 83, ${alpha * 0.82})`;
     ctx.strokeRect(x - radius * 1.8, y - radius, radius * 3.6, radius * 2);
@@ -1433,6 +1613,17 @@ function drawFeatureGlyph(x, y, event, alpha = 0.16, scale = 1, phase = 0) {
   } else if (source === "colorTrace" || source === "color") {
     ctx.fillStyle = event.color ? colorCss(event.color, 0.58) : "rgba(116, 112, 91, 0.5)";
     ctx.fillRect(x - size, y + size * 0.6, size * 2.4, Math.max(1, size * 0.22));
+  } else if (source === "ascii" || source === "symbol") {
+    const glyph = event.glyph || glyphs[event.glyphIndex || 0] || ".";
+    ctx.strokeStyle = "rgba(70, 76, 72, 0.34)";
+    ctx.fillStyle = "rgba(234, 230, 203, 0.18)";
+    ctx.fillRect(x - size * 0.74, y - size * 0.56, size * 1.48, size * 1.12);
+    ctx.strokeRect(x - size * 0.74, y - size * 0.56, size * 1.48, size * 1.12);
+    ctx.font = `${Math.max(5, size * 0.92)}px "SF Mono", "JetBrains Mono", ui-monospace, monospace`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = "rgba(46, 52, 48, 0.32)";
+    ctx.fillText(glyph, x, y);
   } else if (source === "object" || source === "dual") {
     ctx.strokeStyle = "rgba(70, 76, 72, 0.46)";
     ctx.strokeRect(x - size * 1.7, y - size, size * 3.4, size * 2);
@@ -1443,6 +1634,7 @@ function drawFeatureGlyph(x, y, event, alpha = 0.16, scale = 1, phase = 0) {
 
 function visualThreshold(mode) {
   return {
+    ascii: 0.18,
     field: 0.48,
     colorTrace: 0.2,
     xray: 0.68
@@ -1451,6 +1643,7 @@ function visualThreshold(mode) {
 
 function visualAlpha(mode) {
   return {
+    ascii: 0.2,
     field: 0.12,
     colorTrace: 0.26,
     xray: 0.44
@@ -1590,35 +1783,55 @@ function drawColorTrace(area) {
 
 function drawAsciiLayer(area, contrast) {
   ctx.save();
-  ctx.fillStyle = "rgba(250, 251, 248, 0.34)";
+  ctx.fillStyle = "rgba(250, 251, 248, 0.3)";
   ctx.fillRect(0, 0, area.w, area.h);
   const { width, height } = state.imageData;
-  const dot = Math.max(1.05, Math.min(2.8, area.w / 310));
-  const stepX = Math.max(3, Math.floor(width / 170));
-  const stepY = Math.max(3, Math.floor(height / 170));
-  const q = state.imageSignature?.gray || { q50: 0.5, q90: 0.9 };
-  const edgeStats = state.imageSignature?.edge || { q75: 0.2 };
+  const cols = Math.max(52, Math.min(154, Math.floor(area.w / 5.6)));
+  const rows = Math.max(32, Math.min(96, Math.floor(area.h / 7.2)));
+  const stepX = Math.max(1, Math.floor(width / cols));
+  const stepY = Math.max(1, Math.floor(height / rows));
+  const fontSize = Math.max(5.5, Math.min(11, area.w / cols * 1.24));
+  ctx.font = `${fontSize}px "SF Mono", "JetBrains Mono", "IBM Plex Mono", ui-monospace, monospace`;
+  ctx.textBaseline = "middle";
+  ctx.textAlign = "center";
 
   for (let y = 1; y < height - 1; y += stepY) {
     for (let x = 1; x < width - 1; x += stepX) {
       const i = y * width + x;
-      const gray = state.gray[i] / 255;
-      const edge = state.edges[i] / 255;
-      const dark = 1 - gray;
-      const silhouette = clamp01((dark - (1 - q.q50) * 0.52) * 1.8);
-      const line = clamp01((edge - edgeStats.q75 * 0.58) * 3.8);
-      const value = clamp01(silhouette * 0.72 + line * 0.58);
-      if (value < 0.16) continue;
+      const glyphIndex = state.ascii?.[i] || 0;
+      const glyph = glyphs[glyphIndex] || " ";
+      if (glyph === " " && seededWave(x * 0.17 + y * 0.41) > 0.08) continue;
+      const value = state.maps.ascii?.[i] || glyphIndex / (glyphs.length - 1);
       const px = (x / width) * area.w;
       const py = (y / height) * area.h;
-      const radius = dot * (0.45 + value * 0.58) * contrast;
-      ctx.fillStyle = `rgba(42, 47, 44, ${0.1 + value * 0.42})`;
-      ctx.beginPath();
-      ctx.arc(px, py, radius, 0, Math.PI * 2);
-      ctx.fill();
+      const reaction = asciiReactionAt(x / width, y / height);
+      const bloom = reaction * 0.22;
+      if (reaction > 0.1) {
+        ctx.fillStyle = `rgba(232, 226, 180, ${0.05 + reaction * 0.16})`;
+        ctx.fillRect(px - fontSize * 0.58, py - fontSize * 0.72, fontSize * 1.16, fontSize * 1.2);
+      }
+      const replace = reaction > 0.55 && seededWave(x * 9.1 + y * 4.7 + state.playhead * 19) > 0.68;
+      const displayGlyph = replace ? glyphs[Math.min(glyphs.length - 1, glyphIndex + 1)] : glyph;
+      ctx.fillStyle = `rgba(42, 47, 44, ${0.055 + value * 0.42 * contrast + bloom})`;
+      ctx.fillText(displayGlyph, px, py);
     }
   }
   ctx.restore();
+}
+
+function asciiReactionAt(x, y) {
+  let amount = 0;
+  const now = performance.now();
+  state.triggers.forEach((trigger) => {
+    const age = (now - trigger.created) / trigger.life;
+    if (age < 0 || age > 1) return;
+    const dx = trigger.x - x;
+    const dy = trigger.y - y;
+    const distance = Math.hypot(dx, dy);
+    const reach = 0.018 + (trigger.radius || 3) / 720;
+    if (distance < reach) amount += (1 - distance / reach) * (1 - age);
+  });
+  return clamp01(amount);
 }
 
 function drawGrayscaleScan(area, segmented) {
@@ -1857,7 +2070,7 @@ function recordTrigger(event, family, power = 0.5) {
 }
 
 function isMobileAudioDevice() {
-  return /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) || (navigator.maxTouchPoints > 1 && /Macintosh/i.test(navigator.userAgent));
+  return isIOSLike() || /Android/i.test(navigator.userAgent);
 }
 
 function applyAudioPerformanceProfile() {
@@ -1869,36 +2082,143 @@ function applyAudioPerformanceProfile() {
 async function ensureAudio() {
   applyAudioPerformanceProfile();
   if (state.audio?.state === "closed") {
-    state.audio = null;
-    state.audioUnlocked = false;
+    resetAudioSystem();
   }
-  if (state.audio) {
-    if (state.audio.state === "suspended") {
-      await state.audio.resume();
-    }
-    state.audioState = state.audio.state;
-    updateReadouts();
-    return state.audio.state === "running";
+  if (!state.audio) createAudioContext();
+  if (!state.audio) return false;
+  if (state.audio.state === "suspended") {
+    await state.audio.resume().catch(() => {});
   }
+  if (state.audio.state === "running") {
+    rebuildAudioGraph();
+  }
+  state.audioState = state.audio?.state || "none";
+  updateReadouts();
+  return state.audioState === "running";
+}
 
+function markAudioError(error) {
+  state.lastAudioError = error?.message ? error.message.slice(0, 44) : String(error || "unknown").slice(0, 44);
+  state.recoveredErrors += 1;
+}
+
+function disposeGraphNodes() {
+  state.graphNodes.forEach((node) => {
+    try {
+      node.disconnect();
+    } catch (error) {
+      // Already disconnected.
+    }
+  });
+  state.graphNodes = [];
+  state.master = null;
+  state.granularBus = null;
+  state.compressor = null;
+  state.spatial = null;
+  state.delay = null;
+  state.delayGain = null;
+  state.feedbackGain = null;
+  state.reverb = null;
+  state.reverbGain = null;
+  state.noiseBuffer = null;
+  state.masterConnected = false;
+  state.outputReady = false;
+  state.graphContextId = 0;
+}
+
+function resetAudioSystem() {
+  disposeGraphNodes();
+  state.audio = null;
+  state.audioUnlocked = false;
+  state.audioState = "none";
+  state.audioContextId = 0;
+  state.lastRouteTest = "none";
+  state.lastSourceStarted = "none";
+  state.lastSourceStopped = "none";
+}
+
+function createAudioContext() {
   const AudioContext = window.AudioContext || window.webkitAudioContext;
-  const audio = new AudioContext();
+  if (!AudioContext) {
+    state.audioState = "unavailable";
+    state.lastAudioError = "AudioContext unavailable";
+    updateReadouts();
+    return null;
+  }
+  try {
+    state.audio = new AudioContext({ latencyHint: "interactive" });
+  } catch (error) {
+    state.audio = new AudioContext();
+  }
+  state.audioContextId += 1;
+  state.audioState = state.audio.state;
+  return state.audio;
+}
+
+function createMobileSafeSpatial(audio, master) {
+  const input = audio.createGain();
+  const earlyInput = audio.createGain();
+  const lateInput = audio.createGain();
+  const earlyReturn = audio.createGain();
+  const lateReturn = audio.createGain();
+  const memory = audio.createGain();
+  const air = audio.createBiquadFilter();
+  const floor = audio.createBiquadFilter();
+  input.gain.value = 0.0001;
+  earlyInput.gain.value = 0.0001;
+  lateInput.gain.value = 0.0001;
+  earlyReturn.gain.value = 0.0001;
+  lateReturn.gain.value = 0.0001;
+  memory.gain.value = 0.0001;
+  air.type = "lowpass";
+  air.frequency.value = 8000;
+  floor.type = "highpass";
+  floor.frequency.value = 40;
+  input.connect(master);
+  earlyInput.connect(master);
+  lateInput.connect(master);
+  return {
+    input,
+    earlyInput,
+    lateInput,
+    earlyReturn,
+    lateReturn,
+    memory,
+    air,
+    floor,
+    earlyTaps: [],
+    lines: []
+  };
+}
+
+function rebuildAudioGraph() {
+  const audio = state.audio;
+  if (!audio || audio.state === "closed") return false;
+  disposeGraphNodes();
+  state.activeVoices = 0;
   const master = audio.createGain();
   const granularBus = audio.createGain();
   const compressor = audio.createDynamicsCompressor();
-  const spatial = createSpatialResonance(audio, master);
+  const spatial = state.mobileMode
+    ? createMobileSafeSpatial(audio, master)
+    : createSpatialResonance(audio, master);
 
-  master.gain.value = 0.72;
+  master.gain.value = state.mobileMode ? 0.96 : 0.72;
   granularBus.gain.value = controls.granularMute.checked ? 0 : 1;
 
   granularBus.connect(master);
-  granularBus.connect(spatial.input);
-  granularBus.connect(spatial.lateInput);
+  if (!state.mobileMode) {
+    granularBus.connect(spatial.input);
+    granularBus.connect(spatial.lateInput);
+  }
   master.connect(compressor).connect(audio.destination);
+  if (state.isRecording && state.recordDestination && state.recordDestination.context === audio) {
+    compressor.connect(state.recordDestination);
+  }
 
-  state.audio = audio;
   state.master = master;
   state.granularBus = granularBus;
+  state.compressor = compressor;
   state.spatial = spatial;
   state.delay = spatial.earlyInput;
   state.delayGain = spatial.earlyReturn;
@@ -1906,36 +2226,468 @@ async function ensureAudio() {
   state.reverb = spatial.lateInput;
   state.reverbGain = spatial.lateReturn;
   state.noiseBuffer = makeNoiseBuffer(audio);
-  updateEffects();
-  if (audio.state === "suspended") await audio.resume();
+  state.graphContextId = state.audioContextId;
+  state.masterConnected = true;
+  state.graphNodes = [
+    master,
+    granularBus,
+    compressor,
+    spatial.input,
+    spatial.earlyInput,
+    spatial.lateInput,
+    spatial.earlyReturn,
+    spatial.lateReturn,
+    spatial.memory,
+    spatial.air,
+    spatial.floor,
+    ...spatial.earlyTaps.flatMap((tap) => [tap.delay, tap.gain, tap.pan]),
+    ...spatial.lines.flatMap((line) => [
+      line.input,
+      line.delay,
+      line.damp,
+      line.body,
+      line.pan,
+      line.out,
+      ...(line.cross || [])
+    ])
+  ];
   state.audioState = audio.state;
+  updateEffects();
   updateReadouts();
-  return audio.state === "running";
+  return verifyGraphContext();
 }
 
-function playSilentUnlockPulse() {
-  if (!state.audio || state.audioUnlocked) return;
+function verifyGraphContext() {
+  if (!state.audio || !state.master || !state.granularBus) return false;
+  const nodes = [
+    state.master,
+    state.granularBus,
+    state.compressor,
+    state.delay,
+    state.reverb,
+    state.spatial?.input,
+    state.spatial?.lateInput
+  ].filter(Boolean);
+  const sameContext = nodes.every((node) => node.context === state.audio);
+  if (!sameContext) {
+    state.outputReady = false;
+    state.lastRouteTest = "context mismatch";
+  }
+  return sameContext;
+}
+
+function playRouteProbe(destination, label, gainValue = 0.006) {
   const audio = state.audio;
-  const buffer = audio.createBuffer(1, Math.max(1, Math.floor(audio.sampleRate * 0.012)), audio.sampleRate);
-  const source = audio.createBufferSource();
+  if (!audio || audio.state !== "running" || !destination || destination.context !== audio) return false;
+  const now = audio.currentTime || 0;
+  const oscillator = audio.createOscillator();
   const gain = audio.createGain();
-  gain.gain.value = 0.00001;
-  source.buffer = buffer;
-  source.connect(gain).connect(audio.destination);
-  source.start(0);
-  source.stop(audio.currentTime + 0.018);
+  oscillator.type = "sine";
+  oscillator.frequency.setValueAtTime(label === "granular" ? 880 : 520, now);
+  gain.gain.setValueAtTime(0.0001, now);
+  gain.gain.exponentialRampToValueAtTime(gainValue, now + 0.01);
+  gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.09);
+  oscillator.connect(gain).connect(destination);
+  oscillator.start(now);
+  oscillator.stop(now + 0.11);
+  cleanupNodes([oscillator, gain], 0.18);
+  state.lastSourceStarted = label;
+  window.setTimeout(() => {
+    state.lastSourceStopped = label;
+    updateReadouts();
+  }, 160);
+  return true;
+}
+
+function canShareBlob(blob, filename) {
+  if (!navigator.canShare || !navigator.share || typeof File === "undefined") return false;
+  try {
+    const file = new File([blob], filename, { type: blob.type || "application/octet-stream" });
+    return navigator.canShare({ files: [file] });
+  } catch (error) {
+    return false;
+  }
+}
+
+async function saveBlobToDevice(blob, filename) {
+  if (!blob || !blob.size) return false;
+  if (canShareBlob(blob, filename)) {
+    try {
+      const file = new File([blob], filename, { type: blob.type || "application/octet-stream" });
+      await navigator.share({ files: [file], title: filename });
+      return true;
+    } catch (error) {
+      if (error?.name === "AbortError") return false;
+    }
+  }
+  if (window.showSaveFilePicker) {
+    try {
+      const handle = await window.showSaveFilePicker({
+        suggestedName: filename,
+        types: [{
+          description: blob.type || "file",
+          accept: { [blob.type || "application/octet-stream"]: [`.${filename.split(".").pop() || "bin"}`] }
+        }]
+      });
+      const writable = await handle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      return true;
+    } catch (error) {
+      if (error?.name === "AbortError") return false;
+    }
+  }
+  return downloadBlob(blob, filename);
+}
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.rel = "noopener";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  if (isIOSLike()) {
+    window.setTimeout(() => {
+      if (!document.hidden) window.open(url, "_blank");
+    }, 80);
+  }
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+  return true;
+}
+
+function timestampLabel() {
+  return new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+}
+
+function saveImageCapture() {
+  render();
+  const filename = `otoge-score-${timestampLabel()}.png`;
+  if (canvas.toBlob) {
+    canvas.toBlob((blob) => {
+      if (!blob) return;
+      saveBlobToDevice(blob, filename);
+    }, "image/png");
+    return;
+  }
+  const dataUrl = canvas.toDataURL("image/png");
+  const binary = atob(dataUrl.split(",")[1]);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  saveBlobToDevice(new Blob([bytes], { type: "image/png" }), filename);
+}
+
+async function toggleRecording() {
+  if (state.pendingAudioBlob) {
+    await savePendingAudio();
+    return;
+  }
+  if (state.isRecording) {
+    stopRecording();
+    return;
+  }
+  const ok = await ensureAudio();
+  if (!ok || typeof MediaRecorder === "undefined") {
+    state.lastAudioError = "record unavailable";
+    updateReadouts();
+    return;
+  }
+  state.recordDestination = state.audio.createMediaStreamDestination();
+  state.recordChunks = [];
+  if (state.compressor) state.compressor.connect(state.recordDestination);
+  const mimeType = [
+    "audio/webm;codecs=opus",
+    "audio/webm",
+    "audio/mp4"
+  ].find((type) => MediaRecorder.isTypeSupported(type)) || "";
+  const recorderOptions = mimeType ? { mimeType } : undefined;
+  try {
+    state.recorder = new MediaRecorder(state.recordDestination.stream, recorderOptions);
+  } catch (error) {
+    try {
+      state.recorder = new MediaRecorder(state.recordDestination.stream);
+    } catch (fallbackError) {
+      markAudioError(fallbackError);
+      state.recordDestination = null;
+      updateReadouts();
+      return;
+    }
+  }
+  state.recorder.addEventListener("dataavailable", (event) => {
+    if (event.data && event.data.size) state.recordChunks.push(event.data);
+  });
+  state.recorder.addEventListener("stop", () => {
+    const type = state.recorder?.mimeType || mimeType;
+    const blob = new Blob(state.recordChunks, { type });
+    state.recordChunks = [];
+    const extension = type.includes("mp4") ? "m4a" : "webm";
+    if (blob.size) {
+      const filename = `otoge-audio-${timestampLabel()}.${extension}`;
+      if (isIOSLike()) {
+        state.pendingAudioBlob = blob;
+        state.pendingAudioName = filename;
+      } else {
+        saveBlobToDevice(blob, filename);
+      }
+    }
+    try {
+      if (state.compressor && state.recordDestination) state.compressor.disconnect(state.recordDestination);
+    } catch (error) {
+      // Already disconnected.
+    }
+    state.recordDestination = null;
+    state.recorder = null;
+    state.isRecording = false;
+    controls.record?.classList.remove("is-active");
+    if (controls.record) controls.record.textContent = state.pendingAudioBlob ? "save" : "record";
+    updateReadouts();
+  });
+  state.recorder.start(isSafariLike() ? 1000 : undefined);
+  state.isRecording = true;
+  controls.record?.classList.add("is-active");
+  if (controls.record) controls.record.textContent = "stop";
+  updateReadouts();
+}
+
+function stopRecording() {
+  if (state.recorder && state.recorder.state !== "inactive") {
+    try {
+      state.recorder.requestData?.();
+    } catch (error) {
+      // Safari may throw if no data is ready yet.
+    }
+    state.recorder.stop();
+  }
+}
+
+async function savePendingAudio() {
+  if (!state.pendingAudioBlob) return;
+  const blob = state.pendingAudioBlob;
+  const filename = state.pendingAudioName || `otoge-audio-${timestampLabel()}.webm`;
+  const saved = await saveBlobToDevice(blob, filename);
+  if (saved || !isIOSLike()) {
+    state.pendingAudioBlob = null;
+    state.pendingAudioName = "";
+    if (controls.record) controls.record.textContent = "record";
+  }
+  updateReadouts();
+}
+
+async function verifyOutputRoute() {
+  if (!state.audio || state.audio.state !== "running") {
+    state.outputReady = false;
+    state.lastRouteTest = "audio not running";
+    return false;
+  }
+  if (!verifyGraphContext() || !state.masterConnected) {
+    state.outputReady = false;
+    return false;
+  }
+  try {
+    const masterOk = playRouteProbe(state.master, "master", state.mobileMode ? 0.018 : 0.004);
+    const secondaryDestination = state.mobileMode ? state.granularBus : state.spatial?.input;
+    const secondaryOk = playRouteProbe(secondaryDestination, state.mobileMode ? "granular" : "spatial", state.mobileMode ? 0.012 : 0.008);
+    state.outputReady = masterOk && secondaryOk;
+    state.lastRouteTest = state.outputReady ? (state.mobileMode ? "mobile safe" : "master + spatial") : "route failed";
+    updateReadouts();
+    return state.outputReady;
+  } catch (error) {
+    markAudioError(error);
+    state.outputReady = false;
+    state.lastRouteTest = "route error";
+    updateReadouts();
+    return false;
+  }
+}
+
+function playDirectUnlockBeep(audio) {
+  const now = audio.currentTime || 0;
+  const oscillator = audio.createOscillator();
+  const gain = audio.createGain();
+  oscillator.type = "square";
+  oscillator.frequency.value = 880;
+  gain.gain.value = 0.08;
+  oscillator.connect(gain);
+  gain.connect(audio.destination);
+  oscillator.start(now);
+  oscillator.stop(now + 0.18);
+  cleanupNodes([oscillator, gain], 0.28);
+  state.lastSourceStarted = "direct";
+  window.setTimeout(() => {
+    state.lastSourceStopped = "direct";
+    updateReadouts();
+  }, 240);
+}
+
+function hardUnlockAudioFromGesture(event) {
+  if (event?.cancelable) event.preventDefault();
+  applyAudioPerformanceProfile();
+  const nowMs = performance.now();
+  if (nowMs - state.lastHardUnlockAt < 180 && state.audio) return state.audio.state === "running";
+  state.lastHardUnlockAt = nowMs;
+
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) {
+    state.audioState = "unavailable";
+    state.lastAudioError = "AudioContext unavailable";
+    updateReadouts();
+    return false;
+  }
+
+  if (!state.audio || state.audio.state === "closed") {
+    try {
+      state.audio = new AudioContextClass({ latencyHint: "interactive" });
+    } catch (error) {
+      state.audio = new AudioContextClass();
+    }
+    state.audioContextId += 1;
+    disposeGraphNodes();
+  }
+
+  const audio = state.audio;
+  try {
+    playDirectUnlockBeep(audio);
+    state.lastRouteTest = "direct unlock";
+    state.audioState = audio.state;
+    updateReadouts();
+
+    const finishUnlock = () => {
+      state.audioState = audio.state;
+      state.audioUnlocked = audio.state === "running";
+      if (audio.state === "running") {
+        rebuildAudioGraph();
+        verifyOutputRoute();
+      } else {
+        state.outputReady = false;
+        state.lastRouteTest = "unlock suspended";
+      }
+      updateReadouts();
+    };
+
+    if (audio.state === "suspended") {
+      audio.resume().then(finishUnlock).catch((error) => {
+        markAudioError(error);
+        state.audioState = audio.state;
+        updateReadouts();
+      });
+    } else {
+      finishUnlock();
+    }
+    return audio.state === "running";
+  } catch (error) {
+    markAudioError(error);
+    state.audioState = audio.state;
+    updateReadouts();
+    return false;
+  }
+}
+
+async function runRouteTestFromGesture(event) {
+  if (event?.cancelable) event.preventDefault();
+  state.lastTestGestureAt = performance.now();
+  hardUnlockAudioFromGesture(event);
+  if (!state.audio) return false;
+  try {
+    if (state.audio.state === "suspended") await state.audio.resume();
+    state.audioState = state.audio.state;
+    if (state.audio.state !== "running") {
+      state.outputReady = false;
+      state.lastRouteTest = "test suspended";
+      updateReadouts();
+      return false;
+    }
+    rebuildAudioGraph();
+    const directOk = playRouteProbe(state.audio.destination, "direct", state.mobileMode ? 0.04 : 0.012);
+    const masterOk = playRouteProbe(state.master, "master", state.mobileMode ? 0.032 : 0.008);
+    state.audioUnlocked = true;
+    state.outputReady = directOk && masterOk;
+    state.lastRouteTest = state.outputReady ? "test direct + master" : "test failed";
+    updateReadouts();
+    return state.outputReady;
+  } catch (error) {
+    markAudioError(error);
+    state.outputReady = false;
+    state.lastRouteTest = "test error";
+    state.audioState = state.audio?.state || "none";
+    updateReadouts();
+    return false;
+  }
+}
+
+function playUnlockPulse(force = false) {
+  if (!state.audio || (!force && state.audioUnlocked)) return;
+  const audio = state.audio;
+  const now = audio.currentTime || 0;
+  const oscillator = audio.createOscillator();
+  const gain = audio.createGain();
+  oscillator.type = "sine";
+  oscillator.frequency.setValueAtTime(440, now);
+  gain.gain.setValueAtTime(state.mobileMode ? 0.012 : 0.000025, now);
+  gain.gain.exponentialRampToValueAtTime(0.000001, now + 0.045);
+  oscillator.connect(gain).connect(audio.destination);
+  oscillator.start(now);
+  oscillator.stop(now + 0.052);
   state.audioUnlocked = true;
 }
 
-async function unlockAudioFromGesture() {
-  const running = await ensureAudio();
-  if (state.audio?.state === "suspended") {
-    await state.audio.resume();
+function playMobileStartProbe() {
+  if (!state.mobileMode || !state.audio || state.audio.state !== "running" || state.mobileStartProbe) return;
+  const audio = state.audio;
+  const now = audio.currentTime || 0;
+  const oscillator = audio.createOscillator();
+  const gain = audio.createGain();
+  oscillator.type = "sine";
+  oscillator.frequency.setValueAtTime(660, now);
+  gain.gain.setValueAtTime(0.0001, now);
+  gain.gain.exponentialRampToValueAtTime(0.028, now + 0.012);
+  gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.11);
+  oscillator.connect(gain).connect(state.master || audio.destination);
+  oscillator.start(now);
+  oscillator.stop(now + 0.13);
+  cleanupNodes([oscillator, gain], 0.2);
+  state.mobileStartProbe = true;
+}
+
+function primeAudioFromGesture() {
+  applyAudioPerformanceProfile();
+  if (state.audio?.state === "closed") resetAudioSystem();
+  if (!state.audio) createAudioContext();
+  if (!state.audio) return false;
+  if (state.audio.state === "suspended") {
+    state.audio.resume()
+      .then(() => {
+        rebuildAudioGraph();
+        verifyOutputRoute();
+        state.audioState = state.audio?.state || "none";
+        updateReadouts();
+      })
+      .catch(() => {
+        state.audioState = state.audio?.state || "suspended";
+        updateReadouts();
+      });
+  } else if (state.audio.state === "running") {
+    rebuildAudioGraph();
+    verifyOutputRoute();
   }
-  playSilentUnlockPulse();
+  state.audioState = state.audio.state;
+  updateReadouts();
+  return state.audio.state === "running";
+}
+
+async function unlockAudioFromGesture() {
+  const primed = primeAudioFromGesture();
+  if (state.audio?.state === "suspended") {
+    await state.audio.resume().catch(() => {});
+  }
+  if (state.audio?.state === "running") {
+    rebuildAudioGraph();
+    await verifyOutputRoute();
+  }
   state.audioState = state.audio?.state || "none";
   updateReadouts();
-  return running || state.audioState === "running";
+  return (primed || state.audioState === "running") && state.outputReady;
 }
 
 function createSpatialResonance(audio, master) {
@@ -1977,7 +2729,7 @@ function createSpatialResonance(audio, master) {
   const earlyTaps = [0.017, 0.031, 0.049, 0.073].map((time, index) => {
     const delay = audio.createDelay(0.18);
     const gain = audio.createGain();
-    const pan = audio.createStereoPanner();
+    const pan = createPanNode(audio);
     delay.delayTime.value = time;
     gain.gain.value = 0.08;
     pan.pan.value = [-0.62, 0.38, -0.18, 0.72][index];
@@ -1992,7 +2744,7 @@ function createSpatialResonance(audio, master) {
     const delay = audio.createDelay(0.9);
     const damp = audio.createBiquadFilter();
     const body = audio.createBiquadFilter();
-    const pan = audio.createStereoPanner();
+    const pan = createPanNode(audio);
     const out = audio.createGain();
     lineInput.gain.value = 0.42;
     delay.delayTime.value = time;
@@ -2044,6 +2796,14 @@ function checkAudioHealth() {
   state.lastAudioCheck = now;
   if (state.audio.state === "suspended") {
     state.audio.resume().catch(() => {});
+    state.audioState = state.audio.state;
+    if (state.isPlaying && state.mobileMode) {
+      state.isPlaying = false;
+      playButton.textContent = "play";
+      playButton.classList.remove("is-playing");
+    }
+    updateReadouts();
+    return;
   }
   state.audioState = state.audio.state;
   updateReadouts();
@@ -2114,15 +2874,24 @@ async function togglePlay() {
   state.startTime = performance.now() - timelinePosition * durationMs();
   state.lastColumn = -1;
   state.lastGranularStep = -1;
+  playMobileStartProbe();
   playButton.textContent = "stop";
   playButton.classList.add("is-playing");
   animate();
+}
+
+function handlePlayButtonGesture(event) {
+  if (event?.cancelable) event.preventDefault();
+  if (performance.now() - state.lastPlayGestureAt < 500) return;
+  state.lastPlayGestureAt = performance.now();
+  togglePlay();
 }
 
 function stop() {
   state.isPlaying = false;
   playButton.textContent = "play";
   playButton.classList.remove("is-playing");
+  state.mobileStartProbe = false;
   cancelAnimationFrame(state.animation);
   render();
 }
@@ -2215,11 +2984,7 @@ function triggerColumn(timelineProgress, scanProgress) {
   const candidates = eventsInWindow(left, right, voiceCount);
   const activeCandidates = layerCandidates.length
     ? layerCandidates
-    : candidates.length
-      ? candidates
-      : metric.emptiness < 0.68 || stepIndex % 7 === 0
-        ? nearestEvents(scanX, voiceCount)
-        : [];
+    : candidates;
   triggerGranular(stepIndex, left, right, scanX, activeCandidates);
   triggerLayerFamilies(stepIndex, left, right, scanX);
 
@@ -2255,16 +3020,15 @@ function layerForStep(stepIndex) {
     cursor -= item.weight;
     if (cursor <= 0) return item.layer;
   }
-  return state.activeLayer || "contour";
+  return state.activeLayer || "ascii";
 }
 
 function layerWeights() {
   const metric = state.imageMetrics;
   const stats = state.layerStats || {};
-  const colorStrength = Object.entries(state.colorProfile || {}).reduce((sum, [key, value]) => key === "neutral" ? sum : sum + value, 0);
   return [
-    { layer: "field", weight: 0.04 + metric.emptiness * 2.9 + metric.overexposure * 1.8 },
-    { layer: "colorTrace", weight: 0.02 + (stats.colorTrace?.average || 0) * 4.8 + colorStrength * 0.00012 },
+    { layer: "ascii", weight: 0.22 + (stats.ascii?.average || 0) * 5.4 + (stats.ascii?.coverage || 0) * 2.2 + metric.complexity * 1.2 },
+    { layer: "field", weight: 0.08 + (stats.field?.average || 0) * 6.2 + (stats.field?.coverage || 0) * 2.4 + metric.complexity * 1.1 },
     { layer: "xray", weight: 0.02 + (stats.xray?.peak || 0) * 1.4 + (stats.xray?.coverage || 0) * 0.62 + metric.softness * 0.22 }
   ]
     .filter((item) => (state.layerEvents[item.layer] || []).length)
@@ -2367,8 +3131,12 @@ function strongestFromEvents(events, start, end, count) {
 }
 
 function featureScore(event) {
+  const symbolScore = event.scan === "ascii"
+    ? (event.symbolDensity || 0) * 0.28 + (event.symbolCluster || 0) * 0.22 + (event.symbolIsolated || 0) * 0.22 + (event.symbolRun || 0) * 0.2 + (event.symbolSpace || 0) * 0.08
+    : 0;
   return (event.sourceStrength || 0) * 0.82
     + (event.scanValue || 0) * 0.52
+    + symbolScore
     + (event.tonalRarity || 0) * 0.24
     + (event.localContrast || 0) * 0.22
     + event.edge * 0.18
@@ -2378,29 +3146,30 @@ function featureScore(event) {
 
 function triggerGranular(stepIndex, left, right, scanX, fallbackEvents) {
   if (!controls.granular.checked || controls.granularMute.checked || controls.synthMute.checked || !state.audio) return;
-  if (stepIndex === state.lastGranularStep || state.activeVoices > state.maxVoices * 0.82) return;
+  if (stepIndex === state.lastGranularStep || state.activeVoices > state.maxVoices * 0.9) return;
   const metric = state.imageMetrics;
   const level = Number(controls.granularLevel.value) / 100;
   if (level <= 0) return;
-  const density = Math.max(1, Math.min(Number(controls.granularDensity.value), state.mobileMode ? 2 : 6));
-  const fieldEvents = eventsInLayerWindow("field", left, right, 1);
-  const colorEvents = eventsInLayerWindow("colorTrace", left, right, Math.max(1, density));
+  const density = Math.max(1, Math.min(Number(controls.granularDensity.value), state.mobileMode ? 4 : 12));
+  const asciiEvents = eventsInLayerWindow("ascii", left, right, Math.max(1, density + 1));
+  const fieldEvents = eventsInLayerWindow("field", left, right, Math.max(2, Math.ceil(density * 0.55)));
   const xrayEvents = eventsInLayerWindow("xray", left, right, Math.max(1, Math.ceil(density * 0.5)));
-  const sources = [...colorEvents, ...xrayEvents, ...fieldEvents, ...fallbackEvents];
-  const source = sources[stepIndex % Math.max(1, sources.length)] || nearestEvents(scanX, 1)[0];
+  const sources = [...asciiEvents, ...fieldEvents, ...xrayEvents, ...fallbackEvents];
+  const source = sources[stepIndex % Math.max(1, sources.length)];
   if (!source) return;
 
   const imageChance = clamp01(metric.complexity * 0.28 + metric.density * 0.22 + (source.scanValue || 0) * 0.28 + source.edge * 0.2);
   const erosion = Number(controls.chance.value) / 70;
-  const grainChance = clamp01(0.22 + imageChance * 0.58 + level * 0.24 + erosion * 0.16);
+  const grainChance = clamp01(0.32 + imageChance * 0.66 + level * 0.3 + erosion * 0.12);
   if (seededWave(stepIndex * 19.7 + source.x * 41) > grainChance) return;
 
   state.lastGranularStep = stepIndex;
-  const count = Math.min(density, state.mobileMode ? 2 : 6, Math.max(1, state.maxVoices - state.activeVoices));
+  const count = Math.min(density, state.mobileMode ? 4 : 10, Math.max(1, state.maxVoices - state.activeVoices));
   for (let i = 0; i < count; i += 1) {
     const event = sources[(stepIndex + i * 3) % Math.max(1, sources.length)] || source;
     if (!event || !canStartVoice()) break;
-    playGranularGrain(event, state.audio.currentTime + 0.01 + i * (0.012 + metric.distance * 0.012), stepIndex + i * 13);
+    const scatter = seededWave(stepIndex * 3.7 + i * 17.3) * (0.016 + Number(controls.granularSpray.value) / 100 * 0.045);
+    playGranularGrain(event, state.audio.currentTime + 0.006 + i * (0.007 + metric.distance * 0.008) + scatter, stepIndex + i * 13);
   }
 }
 
@@ -2431,6 +3200,7 @@ function triggerLayerFamilies(stepIndex, left, right, scanX) {
 
 function soundFamilyForLayer(layer) {
   const table = {
+    ascii: "symbol",
     field: "air",
     colorTrace: "color",
     xray: "air"
@@ -2447,11 +3217,12 @@ function playGranularGrain(event, time, seed) {
   const spray = Number(controls.granularSpray.value) / 100;
   const pitchShift = Number(controls.granularPitch.value);
   const power = clamp01((event.scanValue || 0) * 0.46 + event.edge * 0.26 + event.dark * 0.12 + (event.soft || 0) * 0.2 + metric.complexity * 0.14);
-  const duration = Math.max(0.018, Math.min(0.34, size / 1000 * (0.48 + power * 0.92 + metric.softness * 0.28)));
+  const fieldStretch = event.scan === "field" ? 1.65 + event.scanValue * 1.1 : 1;
+  const duration = Math.max(0.014, Math.min(0.64, size / 1000 * (0.42 + power * 1.18 + metric.softness * 0.35) * fieldStretch));
   const pitchInfo = frequencyForEvent(event, time);
   const pitch = Math.max(34, pitchInfo.frequency * 2 ** (pitchShift / 12));
-  const detune = (seededWave(seed * 7.1 + event.x * 13) - 0.5) * (12 + spray * 64 + metric.complexity * 22);
-  const reverseBias = seededWave(seed + event.y * 31) < spray * 0.24;
+  const detune = (seededWave(seed * 7.1 + event.x * 13) - 0.5) * (18 + spray * 120 + metric.complexity * 36);
+  const reverseBias = seededWave(seed + event.y * 31) < spray * (event.scan === "field" ? 0.12 : 0.38);
 
   registerVoice(duration);
   const osc = audio.createOscillator();
@@ -2460,13 +3231,13 @@ function playGranularGrain(event, time, seed) {
   const noiseFilter = audio.createBiquadFilter();
   const noiseGain = audio.createGain();
   const filter = audio.createBiquadFilter();
-  const pan = audio.createStereoPanner();
+  const pan = createPanNode(audio);
   const gain = audio.createGain();
   const nodes = [osc, toneGain, noise, noiseFilter, noiseGain, filter, pan, gain];
 
-  osc.type = event.scan === "dust" || event.scan === "grain" ? "triangle" : "sine";
-  osc.frequency.setValueAtTime(pitch * (reverseBias ? 1.5 : 1), time);
-  osc.frequency.exponentialRampToValueAtTime(Math.max(24, pitch * (1 + (event.edge - 0.5) * spray * 0.18)), time + duration * 0.86);
+  osc.type = event.scan === "field" ? "triangle" : event.scan === "dust" || event.scan === "grain" ? "triangle" : "sine";
+  osc.frequency.setValueAtTime(pitch * (reverseBias ? 1.5 : 1) * (event.scan === "field" ? 0.75 : 1), time);
+  osc.frequency.exponentialRampToValueAtTime(Math.max(24, pitch * (1 + (event.edge - 0.5) * spray * 0.32 + (event.scan === "field" ? event.scanValue * 0.08 : 0))), time + duration * 0.86);
   osc.detune.setValueAtTime(detune + pitchInfo.cents * 0.4, time);
   toneGain.gain.setValueAtTime(0.62 + power * 0.38, time);
 
@@ -2476,14 +3247,14 @@ function playGranularGrain(event, time, seed) {
   noiseFilter.type = "bandpass";
   noiseFilter.frequency.setValueAtTime(420 + event.y * 5200 + power * 2400, time);
   noiseFilter.Q.setValueAtTime(4 + event.edge * 10 + spray * 8, time);
-  noiseGain.gain.setValueAtTime((0.006 + event.edge * 0.018) * level * (0.34 + spray), time);
+  noiseGain.gain.setValueAtTime((0.004 + event.edge * 0.014 + (event.scan === "field" ? 0.006 : 0)) * level * (0.34 + spray), time);
 
   filter.type = "bandpass";
   filter.frequency.setValueAtTime(Math.min(9800, 160 + pitch * (1.4 + event.dark * 3.2)), time);
   filter.Q.setValueAtTime(1.2 + Number(controls.resonance.value) * 0.12 + power * 5.2, time);
   pan.pan.setValueAtTime((event.x * 2 - 1) * (0.42 + spray * 0.5), time);
   gain.gain.setValueAtTime(0.0001, time);
-  gain.gain.exponentialRampToValueAtTime((0.012 + power * 0.04) * level, time + 0.006);
+  gain.gain.exponentialRampToValueAtTime((0.014 + power * 0.06) * level * (event.scan === "field" ? 1.35 : 1) * (state.mobileMode ? 1.6 : 1), time + 0.006);
   gain.gain.exponentialRampToValueAtTime(0.0001, time + duration);
 
   osc.connect(toneGain).connect(filter);
@@ -2550,7 +3321,9 @@ function timbreForEvent(event) {
 
 function scanBehavior(event) {
   const value = clamp01(event.scanValue || 0);
+  const symbolic = symbolicBehaviorForEvent(event);
   const table = {
+    ascii: { amp: symbolic.amp, attack: symbolic.attack, release: symbolic.release, cutoff: 0.86 + symbolic.density * 0.62, resonance: symbolic.resonance, pan: 0.58 + (event.symbolIsolated || 0) * 0.55, voice: symbolic.voice },
     contour: { amp: 1.0, attack: 0.9, release: 0.92, cutoff: 1.08, resonance: 0.5, pan: 1.0, voice: null },
     shadow: { amp: 0.86, attack: 1.35, release: 1.22, cutoff: 0.62, resonance: 1.4, pan: 0.62, voice: "sub" },
     dust: { amp: 0.64, attack: 0.34, release: 0.38, cutoff: 1.75, resonance: 0.2, pan: 1.34, voice: "pluck" },
@@ -2592,12 +3365,27 @@ function startLayeredOscillators(layers, time, duration, destination) {
   return nodes;
 }
 
+function createPanNode(audio) {
+  if (typeof audio.createStereoPanner === "function") return audio.createStereoPanner();
+  const gain = audio.createGain();
+  gain.pan = {
+    value: 0,
+    setValueAtTime(value) {
+      this.value = value;
+    },
+    setTargetAtTime(value) {
+      this.value = value;
+    }
+  };
+  return gain;
+}
+
 function playEvent(event, time) {
   if (controls.synthMute.checked) return false;
   if (!canStartVoice()) return false;
   const audio = state.audio;
   const gain = audio.createGain();
-  const pan = audio.createStereoPanner();
+  const pan = createPanNode(audio);
   const filter = audio.createBiquadFilter();
   const preGain = audio.createGain();
   const grind = audio.createWaveShaper();
@@ -2609,22 +3397,32 @@ function playEvent(event, time) {
   if (event.soundFamily) voice = voiceForSoundFamily(event.soundFamily, event);
   const timbre = timbreForEvent(event);
   const scanTone = scanBehavior(event);
+  const symbolic = symbolicBehaviorForEvent(event);
   if (!event.soundFamily && controls.voice.value === "auto" && scanTone.voice) voice = scanTone.voice;
   const pitchInfo = frequencyForEvent(event, time);
-  const pitch = pitchInfo.frequency;
+  const pitch = pitchInfo.frequency * 2 ** ((event.scan === "ascii" ? symbolic.pitch : 0) / 12);
   const scaleBehavior = pitchInfo.behavior;
   if (controls.voice.value === "auto") {
     if (scaleBehavior.family === "kalimba" || scaleBehavior.family === "mbira" || scaleBehavior.family === "slendro" || scaleBehavior.family === "pelog") voice = "bell";
     if (scaleBehavior.family === "raga" || scaleBehavior.family === "spectral") voice = "choir";
   }
   const metric = state.imageMetrics;
-  const power = clamp01(event.edge * 0.34 + event.dark * 0.2 + (event.soft || 0) * 0.24 + (event.scanValue || 0) * 0.42 + metric.atmosphere * 0.16);
+  const power = clamp01(event.edge * 0.24 + event.dark * 0.14 + (event.soft || 0) * 0.18 + (event.scanValue || 0) * 0.34 + metric.atmosphere * 0.12 + (event.symbolDensity || 0) * 0.24 + (event.symbolCluster || 0) * 0.18);
   let attack = Number(controls.attack.value) / 1000;
   const release = Math.min(Number(controls.release.value) / 1000, state.mobileMode ? 0.72 : 1.6);
   attack += metric.softness * 0.06 + metric.distance * 0.04;
   attack *= scanTone.attack;
   let duration = Math.max(0.18, release * (0.58 + power * 0.58 + metric.distance * 0.32));
   duration = Math.min(duration * scaleBehavior.decay * scanTone.release, 1.28 + metric.atmosphere * 0.42 + scaleBehavior.decay * 0.22);
+  if (event.scan === "ascii") {
+    duration = Math.min(2.6, Math.max(0.08, duration * symbolic.release));
+    attack *= symbolic.attack;
+  }
+  if (event.scan === "field") {
+    voice = "choir";
+    attack = Math.max(attack, 0.18 + event.scanValue * 0.18);
+    duration = Math.min(state.mobileMode ? 1.8 : 3.8, Math.max(duration * 1.8, 1.45 + event.scanValue * 1.5));
+  }
   if (voice === "pluck") {
     attack = Math.min(attack, 0.006);
     duration = Math.min(duration, 0.34 + power * 0.18);
@@ -2638,7 +3436,8 @@ function playEvent(event, time) {
   }
   registerVoice(duration);
   const transparency = 0.42 + metric.emptiness * 0.26 + metric.overexposure * 0.16;
-  const amp = (0.012 + power * 0.052) * timbre.amp * scanTone.amp * (0.82 + metric.density * 0.34);
+  const mobileLift = state.mobileMode ? 1.85 : 1;
+  const amp = (0.012 + power * 0.052) * timbre.amp * scanTone.amp * (0.82 + metric.density * 0.34) * mobileLift;
   const cutoff = Number(controls.cutoff.value) * (0.44 + power * 0.82 + metric.overexposure * 0.38) * timbre.cutoff * scanTone.cutoff;
   const glide = Number(controls.glide.value);
   const grindAmount = 0;
@@ -2712,12 +3511,19 @@ function playEvent(event, time) {
       { type: "triangle", frequency: pitch * 2.01, gain: 0.15 + power * 0.1, detune: 4 }
     ], time, duration, preGain));
   } else if (voice === "choir") {
-    sourceNodes.push(...startLayeredOscillators([
+    const choirLayers = [
       { type: "sine", frequency: pitch * 0.5, gain: 0.2 + metric.distance * 0.18, detune: detune - 9 },
       { type: "sine", frequency: pitch, gain: 0.34, detune: detune + 4 },
       { type: "triangle", frequency: pitch * 1.5, gain: 0.16 + metric.atmosphere * 0.16, detune: detune + 11 },
       { type: "sine", frequency: pitch * 2.01, gain: 0.09 + power * 0.08, detune: -13 }
-    ], time, duration * 1.24, preGain));
+    ];
+    if (event.scan === "field") {
+      choirLayers.push(
+        { type: "sine", frequency: pitch * 1.333, gain: 0.12 + event.scanValue * 0.18, detune: detune * 0.22 - 5 },
+        { type: "triangle", frequency: pitch * 1.667, gain: 0.08 + event.scanValue * 0.12, detune: detune * 0.18 + 8 }
+      );
+    }
+    sourceNodes.push(...startLayeredOscillators(choirLayers, time, duration * 1.24, preGain));
   } else if (voice === "sample" && state.sample) {
     const sampleNodes = startSampleVoice(event, pitchInfo, time, duration, preGain, power);
     sourceNodes.push(...sampleNodes);
@@ -2763,6 +3569,7 @@ function playEvent(event, time) {
 
 function voiceForSoundFamily(family, event) {
   const table = {
+    symbol: symbolicBehaviorForEvent(event).voice,
     pluck: event.edge > 0.42 ? "pluck" : "sine",
     low: "sub",
     air: "choir",
@@ -2771,6 +3578,22 @@ function voiceForSoundFamily(family, event) {
   };
   if (family === "color") return voiceForEvent(event);
   return table[family] || voiceForEvent(event);
+}
+
+function symbolicBehaviorForEvent(event) {
+  const glyph = event.glyph || glyphs[event.glyphIndex || 0] || " ";
+  const profile = glyphProfiles[glyph] || glyphProfiles["-"];
+  const run = event.symbolRun || 0;
+  const cluster = event.symbolCluster || 0;
+  const isolated = event.symbolIsolated || 0;
+  return {
+    ...profile,
+    amp: profile.amp * (0.72 + cluster * 0.34 + isolated * 0.22),
+    release: profile.release * (0.72 + run * 0.74 + cluster * 0.2),
+    attack: profile.attack * (0.72 + (event.symbolSpace || 0) * 0.6),
+    resonance: profile.resonance * (0.75 + cluster * 0.5),
+    pitch: profile.pitch + isolated * 0.16 - run * 0.08
+  };
 }
 
 function startSampleVoice(event, pitchInfo, time, duration, destination, power) {
@@ -2827,7 +3650,10 @@ function frequencyForEvent(event, time = 0) {
     + (event.tonalRarity || 0) * (0.08 + asymmetry * 0.08)
     + (event.localContrast || 0) * 0.05
     - (event.soft || 0) * 0.04;
-  const centeredY = clamp01((1 - event.y) * (0.82 + system.center * 0.18) + event.dark * (1 - system.center) * 0.16 + imageBias);
+  const symbolBias = event.scan === "ascii"
+    ? (event.symbolDensity || 0) * 0.1 + (event.symbolIsolated || 0) * 0.08 - (event.symbolRun || 0) * 0.06 - (event.symbolSpace || 0) * 0.12
+    : 0;
+  const centeredY = clamp01((1 - event.y) * (0.82 + system.center * 0.18) + event.dark * (1 - system.center) * 0.16 + imageBias + symbolBias);
   const layoutY = system.layout === "scatter"
     ? clamp01(centeredY + Math.sin(event.x * 27 + event.y * 9) * 0.18)
     : system.layout === "interlock"
@@ -2999,8 +3825,12 @@ function updateReadouts() {
   const audioState = state.audio?.state || state.audioState || "none";
   readouts.perform.textContent = [
     `audio ${audioState}`,
-    state.mobileMode ? "mobile" : "desktop",
-    controls.synthMute.checked ? "muted" : "sound"
+    `ctx ${state.audioContextId || 0}`,
+    state.outputReady ? "route ok" : state.lastRouteTest,
+    state.masterConnected ? `master ${state.master?.gain?.value?.toFixed?.(2) || "ok"}` : "master none",
+    state.audioUnlocked ? "unlocked" : "locked",
+    state.mobileMode ? "mobile safe" : "desktop",
+    state.isRecording ? "recording" : state.pendingAudioBlob ? "audio ready" : state.lastAudioError !== "none" ? `err ${state.lastAudioError}` : controls.synthMute.checked ? "muted" : "sound"
   ].join(" · ");
   readouts.scan.textContent = controls.reverse.checked ? "right → left" : "left → right";
 }
@@ -3011,11 +3841,12 @@ function clearScore() {
   state.imageData = null;
   state.gray = [];
   state.edges = [];
+  state.ascii = null;
   state.colors = [];
   state.colorProfile = null;
   state.maps = {};
   state.layerStats = {};
-  state.activeLayer = "field";
+  state.activeLayer = "ascii";
   state.imageMetrics = {
     density: 0,
     emptiness: 1,
@@ -3036,15 +3867,38 @@ function clearScore() {
 }
 
 loadButton.addEventListener("click", () => fileInput.click());
-playButton.addEventListener("pointerdown", () => {
-  unlockAudioFromGesture().catch(() => {});
-}, { passive: true });
-playButton.addEventListener("touchend", () => {
-  unlockAudioFromGesture().catch(() => {});
-}, { passive: true });
-playButton.addEventListener("click", togglePlay);
+playButton.addEventListener("pointerdown", hardUnlockAudioFromGesture, { passive: false });
+playButton.addEventListener("pointerup", handlePlayButtonGesture, { passive: false });
+playButton.addEventListener("touchstart", hardUnlockAudioFromGesture, { passive: false });
+playButton.addEventListener("touchend", handlePlayButtonGesture, { passive: false });
+playButton.addEventListener("mousedown", () => {
+  primeAudioFromGesture();
+});
+playButton.addEventListener("click", (event) => {
+  if (performance.now() - state.lastPlayGestureAt < 700) {
+    event.preventDefault();
+    return;
+  }
+  togglePlay();
+});
+if (routeTestButton) {
+  routeTestButton.addEventListener("pointerdown", hardUnlockAudioFromGesture, { passive: false });
+  routeTestButton.addEventListener("touchstart", hardUnlockAudioFromGesture, { passive: false });
+  routeTestButton.addEventListener("touchend", (event) => {
+    if (event?.cancelable) event.preventDefault();
+  }, { passive: false });
+  routeTestButton.addEventListener("click", (event) => {
+    if (performance.now() - state.lastHardUnlockAt < 700) {
+      event.preventDefault();
+      return;
+    }
+    runRouteTestFromGesture(event);
+  });
+}
 clearButton.addEventListener("click", clearScore);
 sampleLoadButton.addEventListener("click", () => sampleInput.click());
+controls.saveImage?.addEventListener("click", saveImageCapture);
+controls.record?.addEventListener("click", toggleRecording);
 fileInput.addEventListener("change", (event) => loadFile(event.target.files[0]));
 sampleInput.addEventListener("change", (event) => {
   loadSampleFile(event.target.files[0]);
@@ -3078,6 +3932,28 @@ Object.values(controls).forEach((control) => {
 window.addEventListener("resize", () => {
   resizeCanvas();
   resizeBackdrop();
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") return;
+  if (state.audio) {
+    state.audioState = state.audio.state;
+    if (state.isPlaying && state.audio.state === "running" && (!state.master || !state.masterConnected)) {
+      rebuildAudioGraph();
+    }
+    updateReadouts();
+  }
+});
+
+window.addEventListener("pageshow", () => {
+  if (state.audio) {
+    state.audioState = state.audio.state;
+    updateReadouts();
+  }
+});
+
+window.addEventListener("pagehide", () => {
+  if (state.isRecording) stopRecording();
 });
 resizeCanvas();
 resizeBackdrop();
