@@ -49,6 +49,9 @@ const controls = {
   granularSize: document.querySelector("#granularSizeControl"),
   granularDensity: document.querySelector("#granularDensityControl"),
   granularSpray: document.querySelector("#granularSprayControl"),
+  granularShape: document.querySelector("#granularShapeControl"),
+  granularGlitch: document.querySelector("#granularGlitchControl"),
+  granularNoise: document.querySelector("#granularNoiseControl"),
   granularPitch: document.querySelector("#granularPitchControl"),
   granularMute: document.querySelector("#granularMuteControl"),
   synthMute: document.querySelector("#synthMuteControl"),
@@ -3596,9 +3599,10 @@ function triggerGranular(stepIndex, left, right, scanX, fallbackEvents) {
   if (!controls.granular.checked || controls.granularMute.checked || controls.synthMute.checked || !state.audio) return;
   if (stepIndex === state.lastGranularStep || state.activeVoices > state.maxVoices * 0.9) return;
   const metric = state.imageMetrics;
-  const level = Number(controls.granularLevel.value) / 100 * (0.52 + state.cv.grain * 0.74 + state.cv.transient * 0.18);
+  const breath = 0.5 + Math.sin(state.audio.currentTime * 0.37 + state.cv.grain * 3.2 + state.cv.resonance) * 0.5;
+  const level = Number(controls.granularLevel.value) / 100 * (0.46 + state.cv.grain * 0.92 + state.cv.transient * 0.22 + breath * state.cv.pressure * 0.12);
   if (level <= 0) return;
-  const density = Math.max(1, Math.min(Math.round(Number(controls.granularDensity.value) * (0.46 + state.cv.grain * 0.72 + state.cv.pressure * 0.24)), state.mobileMode ? 4 : 12));
+  const density = Math.max(1, Math.min(Math.round(Number(controls.granularDensity.value) * (0.38 + state.cv.grain * 0.96 + state.cv.pressure * 0.28 + breath * 0.22)), state.mobileMode ? 5 : 14));
   const asciiEvents = eventsInLayerWindow("ascii", left, right, Math.max(1, density + 1));
   const sources = [...asciiEvents, ...fallbackEvents].filter((event) => event?.scan === "ascii");
   const source = sources[stepIndex % Math.max(1, sources.length)];
@@ -3606,16 +3610,19 @@ function triggerGranular(stepIndex, left, right, scanX, fallbackEvents) {
 
   const imageChance = clamp01(metric.complexity * 0.18 + metric.density * 0.14 + state.cv.grain * 0.34 + state.cv.transient * 0.18 + (source.scanValue || 0) * 0.16);
   const erosion = Number(controls.chance.value) / 70;
-  const grainChance = clamp01(0.18 + imageChance * 0.62 + level * 0.24 + erosion * 0.1 - state.cv.silence * 0.18);
+  const grainChance = clamp01(0.14 + imageChance * 0.68 + level * 0.28 + erosion * 0.12 + breath * state.cv.transient * 0.12 - state.cv.silence * 0.2);
   if (seededWave(stepIndex * 19.7 + source.x * 41) > grainChance) return;
 
   state.lastGranularStep = stepIndex;
-  const count = Math.min(density, state.mobileMode ? 4 : 10, Math.max(1, state.maxVoices - state.activeVoices));
+  const count = Math.min(density, state.mobileMode ? 5 : 12, Math.max(1, state.maxVoices - state.activeVoices));
   for (let i = 0; i < count; i += 1) {
-    const event = sources[(stepIndex + i * 3) % Math.max(1, sources.length)] || source;
+    const eventIndex = Math.floor(stepIndex + i * (2 + seededWave(stepIndex * 2.9 + i) * 6) + seededWave(source.y * 73 + i * 11) * sources.length);
+    const event = sources[eventIndex % Math.max(1, sources.length)] || source;
     if (!event || !canStartVoice()) break;
-    const scatter = seededWave(stepIndex * 3.7 + i * 17.3) * (0.016 + Number(controls.granularSpray.value) / 100 * 0.045);
-    playGranularGrain(event, state.audio.currentTime + 0.006 + i * (0.007 + metric.distance * 0.008) + scatter, stepIndex + i * 13);
+    const spray = Number(controls.granularSpray.value) / 100;
+    const scatter = Math.pow(seededWave(stepIndex * 3.7 + i * 17.3), 1.6) * (0.014 + spray * 0.078 + state.cv.grain * 0.026);
+    const clusterDrift = Math.sin((stepIndex + i) * 0.61 + event.x * 9) * state.cv.resonance * 0.018;
+    playGranularGrain(event, state.audio.currentTime + 0.006 + i * (0.004 + metric.distance * 0.006 + state.cv.sustain * 0.006) + scatter + Math.max(0, clusterDrift), stepIndex + i * 13);
   }
 }
 
@@ -3637,61 +3644,185 @@ function playGranularGrain(event, time, seed) {
   const level = Number(controls.granularLevel.value) / 100;
   const size = Number(controls.granularSize.value);
   const spray = Number(controls.granularSpray.value) / 100;
+  const glitchAmount = Number(controls.granularGlitch.value) / 100;
+  const noiseAmount = Number(controls.granularNoise.value) / 100;
   const pitchShift = Number(controls.granularPitch.value);
-  const power = clamp01((event.scanValue || 0) * 0.46 + event.edge * 0.26 + event.dark * 0.12 + (event.soft || 0) * 0.2 + metric.complexity * 0.14);
-  const fieldStretch = event.scan === "field" ? 1.65 + event.scanValue * 1.1 : 1;
-  const duration = Math.max(0.014, Math.min(0.64, size / 1000 * (0.42 + power * 1.18 + metric.softness * 0.35) * fieldStretch));
+  const shape = granularShapeForEvent(event, seed);
+  const cv = state.cv;
+  const power = clamp01((event.scanValue || 0) * 0.38 + event.edge * 0.22 + event.dark * 0.1 + (event.soft || 0) * 0.18 + metric.complexity * 0.12 + (event.symbolEnergy || 0) * 0.22);
+  const durationSeed = seededWave(seed * 5.3 + event.x * 17.1 + event.y * 29.2);
+  const stretchBias = clamp01(shape.longStretch + cv.sustain * 0.38 + cv.drone * 0.22 + (event.symbolRun || 0) * 0.32);
+  const maxDuration = state.mobileMode ? 0.72 : 1.45;
+  const duration = Math.max(0.01, Math.min(maxDuration, size / 1000 * shape.stretch * (0.28 + power * 1.02 + metric.softness * 0.28 + cv.sustain * 0.52) * (0.48 + durationSeed * 1.08) * (1 + stretchBias * 1.2)));
   const pitchInfo = frequencyForEvent(event, time);
-  const pitch = Math.max(34, pitchInfo.frequency * 2 ** (pitchShift / 12));
-  const detune = (seededWave(seed * 7.1 + event.x * 13) - 0.5) * (18 + spray * 120 + metric.complexity * 36);
-  const reverseBias = seededWave(seed + event.y * 31) < spray * (event.scan === "field" ? 0.12 : 0.38);
+  const octaveJump = Math.floor(seededWave(seed * 2.77 + event.y * 4.1) * shape.octaves) - Math.floor(shape.octaves / 2);
+  const pitch = scaleLockedFrequency(Math.max(26, pitchInfo.frequency * 2 ** ((pitchShift + octaveJump * 12 + shape.pitchOffset) / 12)));
+  const detune = scaleLockedDetune((seededWave(seed * 7.1 + event.x * 13) - 0.5) * (28 + spray * shape.detuneSpread + metric.complexity * 58 + cv.grain * 72));
+  const reverseBias = seededWave(seed + event.y * 31) < clamp01(spray * shape.reverse + cv.grain * 0.18 + (event.symbolIsolated || 0) * 0.12);
+  const loopBias = glitchAmount > 0.001 && seededWave(seed * 4.43 + event.x * 101 + event.y * 59) < clamp01((shape.loop + cv.sustain * 0.18 + cv.grain * 0.12 + spray * 0.18) * glitchAmount);
+  const jumpBias = glitchAmount > 0.001 && seededWave(seed * 6.21 + event.x * 43) < clamp01((shape.jump + cv.transient * 0.22 + cv.resonance * 0.16 + spray * 0.12) * glitchAmount);
 
   registerVoice(duration);
   const osc = audio.createOscillator();
   const toneGain = audio.createGain();
-  const noise = audio.createBufferSource();
-  const noiseFilter = audio.createBiquadFilter();
-  const noiseGain = audio.createGain();
+  const useNoise = noiseAmount > 0.001;
+  const noise = useNoise ? audio.createBufferSource() : null;
+  const sampleSource = state.sample ? audio.createBufferSource() : null;
+  const sampleGain = state.sample ? audio.createGain() : null;
+  const noiseFilter = useNoise ? audio.createBiquadFilter() : null;
+  const noiseGain = useNoise ? audio.createGain() : null;
   const filter = audio.createBiquadFilter();
   const pan = createPanNode(audio);
   const gain = audio.createGain();
-  const nodes = [osc, toneGain, noise, noiseFilter, noiseGain, filter, pan, gain];
+  const nodes = [osc, toneGain, filter, pan, gain];
+  if (useNoise) nodes.push(noise, noiseFilter, noiseGain);
+  if (sampleSource && sampleGain) nodes.push(sampleSource, sampleGain);
 
-  osc.type = event.scan === "field" ? "triangle" : event.scan === "dust" || event.scan === "grain" ? "triangle" : "sine";
-  osc.frequency.setValueAtTime(pitch * (reverseBias ? 1.5 : 1) * (event.scan === "field" ? 0.75 : 1), time);
-  osc.frequency.exponentialRampToValueAtTime(Math.max(24, pitch * (1 + (event.edge - 0.5) * spray * 0.32 + (event.scan === "field" ? event.scanValue * 0.08 : 0))), time + duration * 0.86);
-  osc.detune.setValueAtTime(detune + pitchInfo.cents * 0.4, time);
-  toneGain.gain.setValueAtTime(0.62 + power * 0.38, time);
+  osc.type = shape.osc;
+  osc.frequency.setValueAtTime(scaleLockedFrequency(pitch * (reverseBias ? shape.reversePitch : 1)), time);
+  osc.frequency.exponentialRampToValueAtTime(scaleLockedFrequency(Math.max(22, pitch * (1 + (event.edge - 0.5) * spray * 0.56 + shape.pitchBend + cv.resonance * 0.08))), time + duration * (0.42 + durationSeed * 0.5));
+  if (jumpBias) applyGranularPitchJumps(osc.frequency, pitch, time, duration, seed, shape, event);
+  osc.detune.setValueAtTime(detune, time);
+  toneGain.gain.setValueAtTime((0.3 + power * 0.5) * shape.tone, time);
 
-  noise.buffer = state.noiseBuffer;
-  noise.loop = true;
-  noise.playbackRate.setValueAtTime(0.32 + event.edge * 2.2 + spray * 1.6, time);
-  noiseFilter.type = "bandpass";
-  noiseFilter.frequency.setValueAtTime(420 + event.y * 5200 + power * 2400, time);
-  noiseFilter.Q.setValueAtTime(4 + event.edge * 10 + spray * 8, time);
-  noiseGain.gain.setValueAtTime((0.004 + event.edge * 0.014 + (event.scan === "field" ? 0.006 : 0)) * level * (0.34 + spray), time);
+  if (sampleSource && sampleGain) {
+    const sample = state.sample;
+    const buffer = reverseBias && sample.reverseBuffer ? sample.reverseBuffer : sample.buffer;
+    const maxWindow = Math.min(buffer.duration, Math.max(0.014, duration * (loopBias ? 0.18 + spray * 0.16 : 0.55 + shape.stretch * 0.45)));
+    const maxOffset = Math.max(0, buffer.duration - maxWindow - 0.001);
+    const offset = maxOffset * clamp01(event.x * 0.48 + event.y * 0.22 + seededWave(seed * 1.9) * 0.3);
+    const rate = Math.max(0.14, Math.min(4.2, 0.42 + pitch / 680 + shape.rateJitter * (seededWave(seed * 8.31) - 0.5) + spray * 0.42));
+    sampleSource.buffer = buffer;
+    sampleSource.loop = loopBias;
+    if (loopBias) {
+      const loopStart = reverseBias ? Math.max(0, buffer.duration - offset - maxWindow) : offset;
+      const loopEnd = Math.min(buffer.duration, loopStart + Math.max(0.012, maxWindow * (0.42 + seededWave(seed * 9.1) * 0.46)));
+      sampleSource.loopStart = loopStart;
+      sampleSource.loopEnd = loopEnd;
+    }
+    sampleSource.playbackRate.setValueAtTime(rate, time);
+    if (jumpBias) applyGranularRateJumps(sampleSource.playbackRate, rate, time, duration, seed, shape);
+    sampleGain.gain.setValueAtTime((0.015 + power * 0.04) * level * shape.sample, time);
+    sampleSource.connect(sampleGain).connect(filter);
+    sampleSource.start(time, reverseBias ? Math.max(0, buffer.duration - offset - maxWindow) : offset, maxWindow);
+    sampleSource.stop(time + (loopBias ? duration + 0.04 : Math.min(duration + 0.04, maxWindow / rate + 0.08)));
+  }
 
-  filter.type = "bandpass";
-  filter.frequency.setValueAtTime(Math.min(9800, 160 + pitch * (1.4 + event.dark * 3.2)), time);
-  filter.Q.setValueAtTime(1.2 + Number(controls.resonance.value) * 0.12 + power * 5.2, time);
-  pan.pan.setValueAtTime((event.x * 2 - 1) * (0.42 + spray * 0.5), time);
+  if (useNoise) {
+    noise.buffer = state.noiseBuffer;
+    noise.loop = true;
+    noise.playbackRate.setValueAtTime(0.22 + event.edge * 2.8 + spray * 2.4 + shape.noiseRate, time);
+    if (jumpBias) applyGranularRateJumps(noise.playbackRate, 0.22 + event.edge * 2.8 + spray * 2.4 + shape.noiseRate, time, duration, seed + 91, shape);
+    noiseFilter.type = shape.noiseFilter;
+    noiseFilter.frequency.setValueAtTime(Math.max(120, 260 + event.y * 6500 + power * 2900 + shape.filterShift), time);
+    noiseFilter.Q.setValueAtTime(2.2 + event.edge * 12 + spray * 11 + shape.q, time);
+    noiseGain.gain.setValueAtTime((0.002 + event.edge * 0.012 + cv.grain * 0.012 + shape.noise * 0.012) * level * (0.32 + spray * 0.9) * noiseAmount, time);
+  }
+
+  filter.type = shape.filter;
+  filter.frequency.setValueAtTime(Math.min(11800, 130 + pitch * (1.2 + event.dark * 3.8 + shape.filterRatio)), time);
+  filter.frequency.exponentialRampToValueAtTime(Math.min(12400, Math.max(90, pitch * (1.1 + power * 7.5 + cv.air * 3.4))), time + duration * (0.35 + seededWave(seed * 4.7) * 0.52));
+  filter.Q.setValueAtTime(0.8 + Number(controls.resonance.value) * 0.12 + power * 6.6 + shape.q + cv.resonance * 3.4, time);
+  pan.pan.setValueAtTime((event.x * 2 - 1) * (0.36 + spray * 0.68 + cv.width * 0.22) + (seededWave(seed * 11.1) - 0.5) * spray * 0.55, time);
   gain.gain.setValueAtTime(0.0001, time);
-  gain.gain.exponentialRampToValueAtTime((0.014 + power * 0.06) * level * (event.scan === "field" ? 1.35 : 1) * (state.mobileMode ? 1.6 : 1), time + 0.006);
-  gain.gain.exponentialRampToValueAtTime(0.0001, time + duration);
+  gain.gain.exponentialRampToValueAtTime((0.01 + power * 0.064) * level * shape.amp * (state.mobileMode ? 1.35 : 1), time + 0.004 + seededWave(seed * 5.9) * 0.022);
+  const fadeTime = time + duration * (loopBias ? 0.92 + seededWave(seed * 6.7) * 0.08 : 0.74 + seededWave(seed * 6.7) * 0.34);
+  if (loopBias) applyGranularLoopPulses(gain.gain, time, duration, seed, level, power, shape);
+  gain.gain.exponentialRampToValueAtTime(0.0001, fadeTime);
 
   osc.connect(toneGain).connect(filter);
-  noise.connect(noiseFilter).connect(noiseGain).connect(filter);
+  if (useNoise) noise.connect(noiseFilter).connect(noiseGain).connect(filter);
   filter.connect(pan).connect(gain);
   gain.connect(state.granularBus || state.master);
 
   recordTrigger(event, event.scan === "dust" ? "dust" : "grain", power);
 
   osc.start(time);
-  noise.start(time + (reverseBias ? duration * 0.18 : 0));
+  if (useNoise) noise.start(time + (reverseBias ? duration * 0.18 : 0));
   osc.stop(time + duration + 0.02);
-  noise.stop(time + duration + 0.02);
+  if (useNoise) noise.stop(time + duration + 0.02);
   cleanupNodes(nodes, duration + 0.1);
   return true;
+}
+
+function granularShapeForEvent(event, seed) {
+  const shapeAmount = Number(controls.granularShape.value) / 100;
+  const glitchAmount = Number(controls.granularGlitch.value) / 100;
+  const glyph = event.glyph || glyphs[event.glyphIndex || 0] || "-";
+  const density = event.symbolDensity || 0;
+  const isolated = event.symbolIsolated || 0;
+  const run = event.symbolRun || 0;
+  const cluster = event.symbolCluster || 0;
+  const unstable = seededWave(seed * 12.1 + event.x * 19.7 + event.y * 31.3);
+  const table = {
+    ".": { osc: "sine", filter: "highpass", noiseFilter: "highpass", stretch: 0.42, longStretch: 0.05, loop: 0.24, jump: 0.54, detuneSpread: 170, reverse: 0.46, reversePitch: 1.9, pitchOffset: 12, pitchBend: 0.18, octaves: 3, tone: 0.28, noise: 1.0, noiseRate: 2.1, filterRatio: 3.2, filterShift: 2600, q: 3.6, amp: 0.72, sample: 0.54, rateJitter: 1.1 },
+    ":": { osc: "triangle", filter: "bandpass", noiseFilter: "bandpass", stretch: 0.55, longStretch: 0.08, loop: 0.28, jump: 0.5, detuneSpread: 190, reverse: 0.42, reversePitch: 1.62, pitchOffset: 7, pitchBend: 0.12, octaves: 3, tone: 0.5, noise: 0.72, noiseRate: 1.4, filterRatio: 2.4, filterShift: 1800, q: 4.2, amp: 0.86, sample: 0.62, rateJitter: 0.9 },
+    "-": { osc: "sine", filter: "bandpass", noiseFilter: "lowpass", stretch: 1.18, longStretch: 0.48, loop: 0.18, jump: 0.18, detuneSpread: 92, reverse: 0.16, reversePitch: 1.18, pitchOffset: -2, pitchBend: -0.04, octaves: 2, tone: 0.78, noise: 0.28, noiseRate: 0.36, filterRatio: 0.9, filterShift: 320, q: 1.4, amp: 0.94, sample: 0.42, rateJitter: 0.42 },
+    "=": { osc: "triangle", filter: "lowpass", noiseFilter: "bandpass", stretch: 1.55, longStretch: 0.68, loop: 0.24, jump: 0.2, detuneSpread: 76, reverse: 0.12, reversePitch: 1.08, pitchOffset: 0, pitchBend: 0.03, octaves: 2, tone: 0.88, noise: 0.22, noiseRate: 0.22, filterRatio: 1.15, filterShift: 560, q: 2.0, amp: 0.98, sample: 0.46, rateJitter: 0.34 },
+    "+": { osc: "sawtooth", filter: "bandpass", noiseFilter: "bandpass", stretch: 1.0, longStretch: 0.32, loop: 0.38, jump: 0.46, detuneSpread: 230, reverse: 0.32, reversePitch: 1.36, pitchOffset: 5, pitchBend: 0.16, octaves: 4, tone: 0.74, noise: 0.48, noiseRate: 0.88, filterRatio: 1.9, filterShift: 1400, q: 4.8, amp: 1.02, sample: 0.66, rateJitter: 0.86 },
+    "*": { osc: "triangle", filter: "bandpass", noiseFilter: "highpass", stretch: 0.72, longStretch: 0.22, loop: 0.56, jump: 0.72, detuneSpread: 280, reverse: 0.58, reversePitch: 1.72, pitchOffset: 9, pitchBend: 0.24, octaves: 4, tone: 0.58, noise: 0.92, noiseRate: 1.92, filterRatio: 2.8, filterShift: 2400, q: 5.8, amp: 0.92, sample: 0.82, rateJitter: 1.34 },
+    "#": { osc: "sawtooth", filter: "bandpass", noiseFilter: "bandpass", stretch: 0.9, longStretch: 0.34, loop: 0.44, jump: 0.62, detuneSpread: 340, reverse: 0.38, reversePitch: 1.48, pitchOffset: -7, pitchBend: -0.16, octaves: 4, tone: 0.66, noise: 0.78, noiseRate: 1.26, filterRatio: 1.55, filterShift: 900, q: 7.0, amp: 1.04, sample: 0.72, rateJitter: 1.02 },
+    "%": { osc: "square", filter: "notch", noiseFilter: "bandpass", stretch: 0.64, longStretch: 0.26, loop: 0.72, jump: 0.86, detuneSpread: 420, reverse: 0.72, reversePitch: 2.04, pitchOffset: -12, pitchBend: 0.28, octaves: 5, tone: 0.46, noise: 1.0, noiseRate: 2.7, filterRatio: 2.2, filterShift: 3100, q: 8.4, amp: 0.88, sample: 0.9, rateJitter: 1.62 },
+    "@": { osc: "sine", filter: "lowpass", noiseFilter: "lowpass", stretch: 2.05, longStretch: 0.9, loop: 0.36, jump: 0.3, detuneSpread: 130, reverse: 0.22, reversePitch: 0.78, pitchOffset: -19, pitchBend: -0.12, octaves: 3, tone: 0.96, noise: 0.5, noiseRate: 0.12, filterRatio: 0.62, filterShift: -220, q: 5.4, amp: 1.08, sample: 0.58, rateJitter: 0.5 }
+  };
+  const base = table[glyph] || table["-"];
+  const shapedOsc = shapeAmount < 0.18
+    ? "sine"
+    : shapeAmount < 0.42
+      ? (base.osc === "square" || base.osc === "sawtooth" ? "triangle" : base.osc)
+      : base.osc;
+  const shapedFilter = shapeAmount < 0.22 && base.filter === "notch" ? "bandpass" : base.filter;
+  return {
+    ...base,
+    osc: shapedOsc,
+    filter: shapedFilter,
+    stretch: base.stretch * (0.78 + run * 0.72 + state.cv.sustain * 0.36 + unstable * 0.34),
+    loop: base.loop * glitchAmount,
+    jump: base.jump * glitchAmount,
+    reverse: base.reverse * (0.28 + glitchAmount * 0.72),
+    reversePitch: 1 + (base.reversePitch - 1) * glitchAmount,
+    detuneSpread: base.detuneSpread * (0.18 + shapeAmount * 0.54 + state.cv.grain * 0.25 + isolated * 0.22),
+    pitchOffset: (base.pitchOffset + (density - 0.5) * 8 + (unstable - 0.5) * state.cv.pressure * 9) * (0.28 + shapeAmount * 0.72),
+    pitchBend: (base.pitchBend + (cluster - 0.35) * state.cv.resonance * 0.16) * (0.18 + glitchAmount * 0.82),
+    q: base.q * (0.26 + shapeAmount * 0.74) + cluster * 2.2 + state.cv.resonance * 1.5,
+    noise: base.noise,
+    noiseRate: base.noiseRate * (0.25 + glitchAmount * 0.75),
+    filterRatio: base.filterRatio * (0.55 + shapeAmount * 0.45),
+    filterShift: base.filterShift * (0.2 + shapeAmount * 0.8),
+    amp: base.amp * (0.82 + density * 0.24 + state.cv.grain * 0.16),
+    sample: base.sample * (0.7 + state.cv.grain * 0.5),
+    rateJitter: base.rateJitter * (0.18 + glitchAmount * 0.82)
+  };
+}
+
+function applyGranularPitchJumps(param, pitch, time, duration, seed, shape, event) {
+  const steps = Math.max(2, Math.min(7, Math.round(2 + shape.jump * 4 + state.cv.transient * 2)));
+  for (let i = 1; i <= steps; i += 1) {
+    const t = time + duration * (i / (steps + 1));
+    const direction = seededWave(seed * 13.7 + i * 17.9 + event.x * 5) > 0.5 ? 1 : -1;
+    const interval = Math.round(1 + seededWave(seed * 3.13 + i * 7.7) * (4 + shape.octaves * 2));
+    const octave = seededWave(seed * 5.9 + i) > 0.72 ? 12 : 0;
+    const ratio = 2 ** ((direction * interval + octave * direction * shape.jump) / 12);
+    param.setValueAtTime(scaleLockedFrequency(Math.max(22, pitch * ratio)), t);
+  }
+}
+
+function applyGranularRateJumps(param, baseRate, time, duration, seed, shape) {
+  const steps = Math.max(2, Math.min(6, Math.round(2 + shape.jump * 3)));
+  for (let i = 1; i <= steps; i += 1) {
+    const t = time + duration * (i / (steps + 1));
+    const ratio = 2 ** ((seededWave(seed * 4.9 + i * 13.1) - 0.5) * (0.8 + shape.jump * 1.8));
+    param.setValueAtTime(Math.max(0.08, Math.min(5.2, baseRate * ratio)), t);
+  }
+}
+
+function applyGranularLoopPulses(param, time, duration, seed, level, power, shape) {
+  const pulses = Math.max(2, Math.min(8, Math.round(2 + shape.loop * 5 + state.cv.grain * 2)));
+  for (let i = 1; i <= pulses; i += 1) {
+    const t = time + duration * (i / (pulses + 1));
+    const amp = (0.006 + power * 0.05) * level * shape.amp * (0.45 + seededWave(seed * 2.1 + i) * 0.8);
+    param.setValueAtTime(Math.max(0.0001, amp), t);
+  }
 }
 
 function voiceForEvent(event) {
@@ -3770,8 +3901,8 @@ function scanBehavior(event) {
 function startOscillator(type, frequency, time, duration, destination, detune = 0) {
   const osc = state.audio.createOscillator();
   osc.type = type;
-  osc.frequency.setValueAtTime(Math.max(20, frequency), time);
-  osc.detune.setValueAtTime(detune, time);
+  osc.frequency.setValueAtTime(scaleLockedFrequency(frequency), time);
+  osc.detune.setValueAtTime(scaleLockedDetune(detune), time);
   osc.connect(destination);
   osc.start(time);
   osc.stop(time + duration + 0.02);
@@ -3825,7 +3956,7 @@ function playEvent(event, time) {
   const symbolic = symbolicBehaviorForEvent(event);
   if (!event.soundFamily && controls.voice.value === "auto" && scanTone.voice) voice = scanTone.voice;
   const pitchInfo = frequencyForEvent(event, time);
-  const pitch = pitchInfo.frequency * 2 ** ((event.scan === "ascii" ? symbolic.pitch : 0) / 12);
+  const pitch = scaleLockedFrequency(pitchInfo.frequency * 2 ** ((event.scan === "ascii" ? symbolic.pitch : 0) / 12));
   const scaleBehavior = pitchInfo.behavior;
   if (controls.voice.value === "auto") {
     if (scaleBehavior.family === "kalimba" || scaleBehavior.family === "mbira" || scaleBehavior.family === "slendro" || scaleBehavior.family === "pelog") voice = "bell";
@@ -3867,7 +3998,7 @@ function playEvent(event, time) {
   const cutoff = Number(controls.cutoff.value) * (0.34 + power * 0.5 + metric.overexposure * 0.24 + cv.air * 0.34 + cv.transient * 0.2) * timbre.cutoff * scanTone.cutoff;
   const glide = Number(controls.glide.value);
   const grindAmount = 0;
-  const detune = (event.edge - 0.5) * (8 + glide * 0.28 + metric.complexity * 12) + timbre.detune + metric.distance * 4 + pitchInfo.cents;
+  const detune = scaleLockedDetune((event.edge - 0.5) * (8 + glide * 0.28 + metric.complexity * 12) + timbre.detune + metric.distance * 4 + pitchInfo.cents);
 
   filter.type = "lowpass";
   filter.frequency.setValueAtTime(Math.min(12000, cutoff), time);
@@ -3892,8 +4023,8 @@ function playEvent(event, time) {
     carrier.type = "sine";
     mod.type = "triangle";
     carrier.frequency.setValueAtTime(pitch, time);
-    if (glide > 0) carrier.frequency.exponentialRampToValueAtTime(pitch * (1 + (event.edge - 0.5) * glide * 0.002), time + duration * 0.55);
-    mod.frequency.setValueAtTime(pitch * (timbre.fmRatio + event.dark), time);
+    if (glide > 0) carrier.frequency.exponentialRampToValueAtTime(scaleLockedFrequency(pitch * (1 + (event.edge - 0.5) * glide * 0.002)), time + duration * 0.55);
+    mod.frequency.setValueAtTime(scaleLockedFrequency(pitch * (timbre.fmRatio + event.dark)), time);
     modGain.gain.setValueAtTime((18 + power * 120) * timbre.fmDepth, time);
     mod.connect(modGain).connect(carrier.frequency);
     carrier.detune.setValueAtTime(detune, time);
@@ -3957,7 +4088,7 @@ function playEvent(event, time) {
     const osc = audio.createOscillator();
     osc.type = voice;
     osc.frequency.setValueAtTime(pitch, time);
-    if (glide > 0) osc.frequency.exponentialRampToValueAtTime(pitch * (1 + (event.dark - 0.5) * glide * 0.002), time + duration * 0.65);
+    if (glide > 0) osc.frequency.exponentialRampToValueAtTime(scaleLockedFrequency(pitch * (1 + (event.dark - 0.5) * glide * 0.002)), time + duration * 0.65);
     osc.detune.setValueAtTime(detune, time);
     osc.connect(preGain);
     sourceNodes.push(osc);
@@ -3969,7 +4100,7 @@ function playEvent(event, time) {
     const drone = audio.createOscillator();
     const droneGain = audio.createGain();
     drone.type = "sine";
-    drone.frequency.setValueAtTime(pitch * 0.5, time);
+    drone.frequency.setValueAtTime(scaleLockedFrequency(pitch * 0.5), time);
     droneGain.gain.setValueAtTime(0.0001, time);
     droneGain.gain.exponentialRampToValueAtTime(0.018 * event.dark, time + 0.08);
     droneGain.gain.exponentialRampToValueAtTime(0.0001, time + Math.max(0.5, release * 1.7));
@@ -4038,14 +4169,15 @@ function startSampleVoice(event, pitchInfo, time, duration, destination, power) 
   const maxOffset = Math.max(0, buffer.duration - sourceWindow - 0.002);
   const positionSeed = clamp01(event.x * 0.44 + event.y * 0.18 + (event.colorRarity || 0) * 0.22 + (event.tonalRarity || 0) * 0.16);
   const offset = maxOffset * positionSeed;
-  const pitchRatio = clamp01(pitchInfo.frequency / 880);
+  const lockedPitch = scaleLockedFrequency(pitchInfo.frequency);
+  const pitchRatio = clamp01(lockedPitch / 880);
   const rate = Math.max(0.2, Math.min(3.8, 0.5 + pitchRatio * 1.6 + (event.pitchBias || 0) * 0.7));
   const nodeDuration = Math.min(duration * (0.72 + texture * 0.5), sourceWindow / rate + 0.08);
 
   source.buffer = reverse ? sample.reverseBuffer : buffer;
   source.playbackRate.setValueAtTime(rate, time);
   body.type = event.scan === "xray" ? "bandpass" : "lowpass";
-  body.frequency.setValueAtTime(Math.min(11800, 420 + pitchInfo.frequency * (1.6 + texture * 4.2)), time);
+  body.frequency.setValueAtTime(Math.min(11800, 420 + lockedPitch * (1.6 + texture * 4.2)), time);
   body.Q.setValueAtTime(0.7 + texture * 5 + Number(controls.resonance.value) * 0.08, time);
   trim.gain.setValueAtTime((0.34 + power * 0.88) * level, time);
 
@@ -4057,8 +4189,8 @@ function startSampleVoice(event, pitchInfo, time, duration, destination, power) 
   resonatorGain.gain.setValueAtTime(0.12 * level * (0.3 + texture), time);
   resonatorGain.connect(destination);
   const resonators = startLayeredOscillators([
-    { type: "sine", frequency: pitchInfo.frequency, gain: 0.28 + texture * 0.22, detune: pitchInfo.cents * 0.25 },
-    { type: "triangle", frequency: pitchInfo.frequency * (1.5 + event.dark * 0.12), gain: 0.08 + event.edge * 0.08, detune: -7 + (event.colorRarity || 0) * 11 }
+    { type: "sine", frequency: lockedPitch, gain: 0.28 + texture * 0.22, detune: 0 },
+    { type: "triangle", frequency: lockedPitch * (1.5 + event.dark * 0.12), gain: 0.08 + event.edge * 0.08, detune: 0 }
   ], time, Math.min(duration, 0.72 + texture * 0.5), resonatorGain);
 
   return [source, body, trim, resonatorGain, ...resonators];
@@ -4137,6 +4269,57 @@ function frequencyForEvent(event, time = 0) {
   const cents = micro + bend + paired;
   const midi = baseMidi + semitone;
   return { frequency: 440 * 2 ** ((midi - 69 + cents / 100) / 12), cents, behavior: system };
+}
+
+function scaleLockedFrequency(frequency) {
+  if (!Number.isFinite(frequency) || frequency <= 0) return 20;
+  const system = scaleSystems[controls.scale.value] || scaleSystems.kalimbaPentatonic;
+  const baseMidi = 48 + keyOffsets[controls.key.value] + Number(controls.octave.value) * 12;
+  const targetMidi = 69 + 12 * Math.log2(Math.max(20, frequency) / 440);
+  const pool = scaleLockPool(system);
+  let bestMidi = targetMidi;
+  let bestDistance = Infinity;
+
+  for (let octave = -6; octave <= 8; octave += 1) {
+    pool.forEach((step) => {
+      const candidate = baseMidi + step + octave * 12;
+      const distance = Math.abs(candidate - targetMidi);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        bestMidi = candidate;
+      }
+    });
+  }
+
+  return Math.max(20, 440 * 2 ** ((bestMidi - 69) / 12));
+}
+
+function scaleLockPool(system) {
+  if (system.ratios) {
+    return system.ratios.map((ratio) => 12 * Math.log2(ratio)).filter((value) => Number.isFinite(value));
+  }
+  if (system.partials) {
+    return system.partials.map((partial) => {
+      const octaveFold = partial / 2 ** Math.floor(Math.log2(partial));
+      return 12 * Math.log2(octaveFold);
+    }).filter((value) => Number.isFinite(value));
+  }
+  if (system.morphTo) {
+    const metric = state.imageMetrics;
+    const phase = state.playhead || 0;
+    const morph = clamp01(metric.atmosphere * 0.44 + metric.complexity * 0.34 + (Math.sin(phase * Math.PI * 2) + 1) * 0.11);
+    const max = Math.max(system.intervals.length, system.morphTo.length);
+    return Array.from({ length: max }, (_, i) => {
+      const a = system.intervals[i % system.intervals.length];
+      const b = system.morphTo[i % system.morphTo.length];
+      return a + (b - a) * morph;
+    });
+  }
+  return system.intervals && system.intervals.length ? system.intervals : [0, 2, 4, 7, 9];
+}
+
+function scaleLockedDetune() {
+  return 0;
 }
 
 function updateEffects() {
